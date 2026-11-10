@@ -46,10 +46,11 @@ from strategy import evaluate
 
 
 
-# --- Cloady health endpoint on port 3000 (runs in background thread) ---
+# --- Health endpoint (runs in background thread; port from $PORT, default 3000) ---
 def _start_health_server():
     import threading
     from http.server import BaseHTTPRequestHandler, HTTPServer
+    _port = int(os.environ.get("PORT", "3000"))
     class H(BaseHTTPRequestHandler):
         def do_GET(self):
             self.send_response(200)
@@ -61,7 +62,7 @@ def _start_health_server():
                 log_text = "(no log yet)"
             self.wfile.write(f"Binance bot dry-run alive\n\n{log_text}".encode())
         def log_message(self, *a): pass
-    threading.Thread(target=lambda: HTTPServer(("0.0.0.0", 3000), H).serve_forever(), daemon=True).start()
+    threading.Thread(target=lambda: HTTPServer(("0.0.0.0", _port), H).serve_forever(), daemon=True).start()
 _start_health_server()
 
 def log(msg: str) -> None:
