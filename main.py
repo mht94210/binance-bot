@@ -320,7 +320,13 @@ def main() -> None:
                 save_state()
                 time.sleep(60)
                 continue
-            time.sleep(60)
+            # 持仓心跳：持仓时每 20 秒记一行，证明循环活着；止损/止盈/保本也查得更勤，
+            # 避免 1 分钟才查一次错过价格尖峰
+            float_pnl = (price - entry) * position["qty"] if side == "LONG" else (entry - price) * position["qty"]
+            log(f"持仓中：{side} @{entry:.1f}，现价 {price:.1f}，浮盈 {float_pnl:+.2f} U，"
+                f"止损 {stop_loss:.1f}，止盈 {take_profit:.1f}，"
+                f"保本{'已移' if position['breakeven_done'] else '未触发'}。")
+            time.sleep(20)
             continue
 
         # ---------- 无持仓：等 5 分钟 K 线收盘再判断 ----------
