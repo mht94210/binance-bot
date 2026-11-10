@@ -74,8 +74,8 @@ class RiskManager:
         """返回 (能不能开单, 原因)。原因空字符串表示可以开。"""
         if self.trades_today >= MAX_TRADES_PER_DAY:
             return False, f"今日已开 {self.trades_today} 单，达到上限 {MAX_TRADES_PER_DAY} 单。"
-        if self.daily_loss_usdt >= MAX_DAILY_LOSS_USDT:
-            return False, f"今日亏损 {self.daily_loss_usdt:.2f} U，达到熔断 {MAX_DAILY_LOSS_USDT:.0f} U。"
+        if self.daily_pnl_usdt <= -MAX_DAILY_LOSS_USDT:
+            return False, f"今日净盈亏 {self.daily_pnl_usdt:.2f} U，达到熔断 -{MAX_DAILY_LOSS_USDT:.0f} U。"
         if now is None:
             return True, ""
         if self.pause_until is not None and now < self.pause_until:
@@ -93,7 +93,7 @@ class RiskManager:
         return True, ""
 
     def should_stop_for_day(self) -> bool:
-        return self.daily_loss_usdt >= MAX_DAILY_LOSS_USDT
+        return self.daily_pnl_usdt <= -MAX_DAILY_LOSS_USDT
 
     def record_trade_opened(self, now: float | None = None) -> None:
         self.trades_today += 1

@@ -52,7 +52,8 @@ def evaluate(price: float, atr: float | None, ema200_1h: float | None,
              volume: float | None, volume_sma: float | None,
              log=None) -> dict | None:
     """
-    在一根 5 分钟 K 线收盘时调用。price 是这根 K 线的收盘价。
+    在一根 5 分钟 K 线收盘时调用。price 是判断时的实时价（不是那根 K 线的收盘价，
+    避免入场价滞后）；指标（ATR/ADX/EMA/均线/分界线/量能）仍按已收盘 K 线算。
     指标缺失（预热期）时直接返回 None，不过滤也不开单。
     返回信号 dict，或 None（无信号）。信号一定带 stop_loss 和 take_profit。
     被某道闸门挡住时，如传了 log 就记一条原因，方便查为什么没开单。

@@ -62,7 +62,7 @@ def _start_health_server():
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
             try:
-                log_text = Path(__file__).resolve().parent.joinpath("bot.log").read_text(encoding="utf-8")[-2000:]
+                log_text = Path(__file__).resolve().parent.joinpath("bot.log").read_text(encoding="utf-8")[-8000:]
             except Exception:
                 log_text = "(no log yet)"
             self.wfile.write(f"Binance bot dry-run alive\n\n{log_text}".encode())
@@ -239,10 +239,12 @@ def main() -> None:
             "position": position,
         }, ensure_ascii=False), encoding="utf-8")
 
-    # 断点续跑：读回当天的计数和持仓（只做本地记录）
+    # 断点续跑：持仓不论日期都恢复（跨 UTC 午夜重启也不丢单）；
+    # 当日计数只在同一天才恢复，换了日期就从 0 开始。
     if state_file.exists():
         try:
             saved = json.loads(state_file.read_text(encoding="utf-8"))
+            position = saved.get("position")
             if saved.get("date") == utc_today():
                 risk.trades_today = saved.get("trades_today", 0)
                 risk.consecutive_losses = saved.get("consecutive_losses", 0)
@@ -251,11 +253,23 @@ def main() -> None:
                 risk.last_close_at = saved.get("last_close_at")
                 risk.last_close_was_sl = saved.get("last_close_was_sl", False)
                 risk.pause_until = saved.get("pause_until")
-                position = saved.get("position")
                 log(f"恢复今日状态: 已开 {risk.trades_today} 单，连亏 {risk.consecutive_losses} 单，"
                     f"今日盈亏 {risk.daily_pnl_usdt:+.2f} U，持仓: {'有' if position else '无'}")
+            elif position:
+                log(f"跨日重启：恢复未平持仓 {position['side']} @{position['entry']:.1f}，"
+                    f"今日计数从 0 开始。")
         except Exception:  # noqa: BLE001
             pass
+
+    # 启动预热：跳过当前这根 5 分钟 K 线，等下一根收盘再判断，
+    # 避免重启后几秒钟就按一根快收完的 K 线立即开单。
+    try:
+        _warm = compute_indicators()
+        if _warm is not None:
+            last_eval_candle = _warm["candle_open_time"]
+            log("启动预热：已跳过当前 5 分钟 K 线，等下一根收盘再判断。")
+    except Exception:  # noqa: BLE001
+        pass
 
     while True:
         if stop_file.exists():
@@ -270,7 +284,7 @@ def main() -> None:
 
         if risk.should_stop_for_day():
             if not halted_logged:
-                log(f"今日亏损已达 {MAX_DAILY_LOSS_USDT:.0f} U 熔断，停手，等 UTC 午夜自动清零。")
+                log(f"今日净亏损已达 {MAX_DAILY_LOSS_USDT:.0f} U 熔断，停手，等 UTC 午夜自动清零。")
                 halted_logged = True
             time.sleep(60)
             continue
@@ -341,7 +355,9 @@ def main() -> None:
             continue
         last_eval_candle = indicators["candle_open_time"]
 
-        signal = evaluate(price=indicators["price"], atr=indicators["atr"],
+        # 入场按判断时的实时价，不用滞后的 5 分钟 K 线收盘价（2026-11-10 的教训：
+        # 收盘价 72964.9 开单时实时价已到约 73290，差了 325 点）
+        signal = evaluate(price=price, atr=indicators["atr"],
                           ema200_1h=indicators["ema200_1h"], adx15=indicators["adx15"],
                           ma_fast=indicators["ma_fast"], ma_slow=indicators["ma_slow"],
                           midline=indicators["midline"],
@@ -367,6 +383,14 @@ def main() -> None:
             time.sleep(60)
             continue
         signal["max_loss_usdt"] = max_loss
+
+        # 下单前校验：没止损止盈、方向不对、亏损超上限，一律拒绝
+        try:
+            risk.validate_order(signal)
+        except ValueError as e:
+            log(f"风控拦截：{e}")
+            time.sleep(60)
+            continue
 
         if DRY_RUN:
             place_order_dry_run(signal, qty, margin_usdt)
