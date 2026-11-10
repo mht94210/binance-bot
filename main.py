@@ -1,5 +1,7 @@
 """
-Binance BTCUSDT 永续合约短线机器人 —— 骨架版（默认 Dry-Run，不下真实单）
+Binance BTCUSDT 永续合约短线机器人 —— 10 倍快进快出方案（默认 Dry-Run，不下真实单）
+
+版本：2026-11-10 用户确认（综合 3Commas / Cryptohopper / Pionex / Freqtrade 等做法后定）。
 
 安全原则：
 - 默认 DRY_RUN = True：只看行情、只记录“本来会下的单”，绝不调下单接口。
@@ -9,41 +11,44 @@ Binance BTCUSDT 永续合约短线机器人 —— 骨架版（默认 Dry-Run，
 - API Key / Secret 只从环境变量或 config.json 读，绝不写死在代码里。
   本仓库不含任何真实 Key、Secret、账号、密码。
 
-风控（写死在 config.py，见 RISK 部分）：
-- 只做 BTCUSDT 永续，不做山寨币
-- 杠杆 5 倍
-- 一单最多 200 USDT 保证金
-- 每单必须带止损止盈，否则拒绝下单
-- 单笔最大亏损 40 USDT（本金 2000 的 2%），目标控制在 20-40 USDT
-- 一天最多亏 100 USDT，达到即停手
-- 一天最多 30 单
+策略（写死在 config.py）：
+- 10 倍杠杆，一单最多 200 U 保证金，名义仓位 2000 U
+- 信号：5 分钟 K 线收盘时判断（1 小时 EMA200 定方向 + 15 分钟 ADX>23 + 5 分钟均线，3 选 2）
+- 止损 1.5 倍 ATR，止盈 2.25 倍 ATR，盈亏比 1:1.5；止盈目标 < 0.30% 不做
+- 赚到 1 倍风险就把止损移到成本价（保本）；进场限价单，止损市价单
+- 冷却 15 分钟，止损后 30 分钟；每天最多 10 单，同时最多 1 单
+- 熔断：一天亏 40 U（本金 2%）停；连亏 3 单休息 1 小时；大消息前后 30 分钟不交易
+- 当日计数按 UTC 日期自动清零（2026-11-07 的教训：旧版只在重启时清零，跑着不动就一直卡在上限）
 """
 import json
 import os
 import sys
 import time
-from collections import deque
-from datetime import date
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import (
+    ADX_PERIOD,
+    ATR_PERIOD,
+    DATA_BASE_URL,
     DRY_RUN,
+    EMA_PERIOD_1H,
     LIVE_TRADING_ENABLED,
-    LONG_TRIGGER,
     MA_FAST_PERIOD,
     MA_SLOW_PERIOD,
+    MAKER_FEE_PCT,
     MAX_DAILY_LOSS_USDT,
     MAX_TRADES_PER_DAY,
-    MIDLINE_WINDOW_MINUTES,
     SYMBOL,
-    TREND_SHORT_TRIGGER,
+    TAKER_FEE_PCT,
+    VOL_SMA_PERIOD,
     load_api_credentials,
 )
+from indicators import adx, atr, ema, sma
 from risk import RiskManager
 from strategy import evaluate
-
 
 
 # --- Health endpoint (runs in background thread; port from $PORT, default 3000) ---
@@ -65,6 +70,8 @@ def _start_health_server():
     threading.Thread(target=lambda: HTTPServer(("0.0.0.0", _port), H).serve_forever(), daemon=True).start()
 _start_health_server()
 
+
+
 def log(msg: str) -> None:
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
@@ -73,31 +80,99 @@ def log(msg: str) -> None:
         f.write(line + "\n")
 
 
-def get_price_dry_run() -> float | None:
-    """Dry-Run 下用币安公开行情接口读价（无需 API Key，不交易）。"""
+def utc_today() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+# ---------- 行情（公开接口，无需 API Key，不交易）----------
+def _http_get(path: str, params: dict) -> object | None:
     try:
         import requests
 
-        r = requests.get(
-            "https://fapi.binance.com/fapi/v1/ticker/price",
-            params={"symbol": SYMBOL},
-            timeout=10,
-        )
+        r = requests.get(f"{DATA_BASE_URL}{path}", params=params, timeout=10)
         r.raise_for_status()
-        return float(r.json()["price"])
-    except Exception as e:  # noqa: BLE001 - 骨架里只记日志，不崩
-        log(f"读价失败: {e}")
+        return r.json()
+    except Exception as e:  # noqa: BLE001 - 读行情失败只记日志，不崩
+        log(f"读行情失败 {path}: {e}")
         return None
 
 
+def get_price_dry_run() -> float | None:
+    """现价（ticker）。"""
+    data = _http_get("/fapi/v1/ticker/price", {"symbol": SYMBOL})
+    if not isinstance(data, dict) or "price" not in data:
+        return None
+    try:
+        return float(data["price"])
+    except (TypeError, ValueError):
+        return None
+
+
+def get_klines(interval: str, limit: int) -> list[dict]:
+    """K 线：返回已收盘 + 未收盘的全部 K 线（调用方自己去掉最后一根未收盘的）。
+    每根：{"open_time","open","high","low","close","volume"}。"""
+    data = _http_get("/fapi/v1/klines", {"symbol": SYMBOL, "interval": interval, "limit": limit})
+    if not isinstance(data, list):
+        return []
+    out = []
+    for row in data:
+        try:
+            out.append({
+                "open_time": int(row[0]),
+                "open": float(row[1]),
+                "high": float(row[2]),
+                "low": float(row[3]),
+                "close": float(row[4]),
+                "volume": float(row[5]),
+            })
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out
+
+
+def compute_indicators() -> dict | None:
+    """拉三组 K 线，算出信号要用的全部指标。失败返回 None。
+    只用已收盘的 K 线（去掉每组最后一根未收盘的）。"""
+    k5 = get_klines("5m", 40)
+    k15 = get_klines("15m", 40)
+    k1h = get_klines("1h", 210)
+    if len(k5) < ATR_PERIOD + 2 or len(k15) < ADX_PERIOD * 2 + 1 or len(k1h) < EMA_PERIOD_1H + 1:
+        log("K 线不够，指标算不出来，等下一根 5 分钟 K 线。")
+        return None
+    closed5 = k5[:-1]
+    closed15 = k15[:-1]
+    closed1h = k1h[:-1]
+    closes5 = [k["close"] for k in closed5]
+    closes1h = [k["close"] for k in closed1h]
+    volumes5 = [k["volume"] for k in closed5]
+    atr_value = atr(closed5, ATR_PERIOD)
+    adx_value, _, _ = adx(closed15, ADX_PERIOD)
+    # 滚动分界线：最近 12 根 5 分钟 K 线（60 分钟）最高最低价的中点，跟着市场走
+    recent = closed5[-12:]
+    midline = (max(k["high"] for k in recent) + min(k["low"] for k in recent)) / 2
+    return {
+        "candle_open_time": closed5[-1]["open_time"],
+        "price": closed5[-1]["close"],
+        "atr": atr_value,
+        "ema200_1h": ema(closes1h, EMA_PERIOD_1H),
+        "adx15": adx_value,
+        "ma_fast": sma(closes5, MA_FAST_PERIOD),
+        "ma_slow": sma(closes5, MA_SLOW_PERIOD),
+        "midline": midline,
+        "volume": closed5[-1]["volume"],
+        "volume_sma": sma(volumes5, VOL_SMA_PERIOD),
+    }
+
+
+# ---------- 下单 ----------
 def place_order_dry_run(signal: dict, qty: float, margin_usdt: float) -> None:
     """Dry-Run：只记录，不下单。"""
     log(
         "[DRY-RUN] 本来会下单: "
         f"{signal['side']} {SYMBOL} qty={qty:.5f} 保证金={margin_usdt:.2f} USDT "
         f"入场~{signal['entry']:.1f} 止损={signal['stop_loss']:.1f} "
-        f"止盈1={signal['take_profit_1']:.1f} 止盈2={signal.get('take_profit_2') or '-'} "
-        f"预期最大亏损={signal['max_loss_usdt']:.2f} USDT"
+        f"止盈={signal['take_profit_1']:.1f} "
+        f"预期最大亏损={signal['max_loss_usdt']:.2f} USDT | {signal['reason']}"
     )
 
 
@@ -106,23 +181,37 @@ def place_order_live(signal: dict, qty: float, margin_usdt: float) -> None:
     实盘下单入口（骨架：默认永不执行）。
 
     只有在 DRY_RUN=False 且 LIVE_TRADING_ENABLED=True 时才会被调用，
-    且调用前 RiskManager 已校验过：止损止盈齐全、单笔亏损 <= 40 USDT、
-    当日亏损未超 100 USDT、当日单数未超 30 单。
-    真正接通时在这里用 python-binance 下单，并立即挂止损止盈单。
+    且调用前 RiskManager 已校验过。真正接通时在这里用 python-binance
+    下 Post Only 限价单进场，并立即挂止损市价单和止盈限价单。
     当前版本为防止误操作，直接拒绝执行。
     """
     raise RuntimeError(
-        "实盘下单未接通：本骨架默认 Dry-Run。请先在 README.md 里完成 "
+        "实盘下单未接通：本版本默认 Dry-Run。请先在 README.md 里完成 "
         "API 权限检查、风控确认和试运行，再由人工打开实盘开关。"
     )
 
 
+def close_pnl(position: dict, exit_price: float, exit_is_maker: bool) -> float:
+    """算一单的模拟盈亏（含手续费）。进场永远是 maker（Post Only 限价单）；
+    出场走止盈是 maker，走止损是 taker（市价单）。"""
+    qty = position["qty"]
+    entry = position["entry"]
+    direction = 1 if position["side"] == "LONG" else -1
+    gross = direction * qty * (exit_price - entry)
+    entry_fee = qty * entry * MAKER_FEE_PCT
+    exit_fee = qty * exit_price * (MAKER_FEE_PCT if exit_is_maker else TAKER_FEE_PCT)
+    return gross - entry_fee - exit_fee
+
+
 def main() -> None:
     log("=" * 60)
-    log("BTCUSDT 合约短线机器人启动（组合自适应版）")
+    log("BTCUSDT 合约短线机器人启动（10 倍快进快出方案，2026-11-10 用户确认）")
     log(f"标的: {SYMBOL} | Dry-Run: {DRY_RUN} | 实盘开关: {LIVE_TRADING_ENABLED}")
-    log("策略: 趋势3单 + 小区间200点 + 大区间1000点，按市场情况合理选用；碰边确认才进，分界线滚动跟市场走，均线金叉只做多、死叉只做空，同一方向10分钟冷却，一天总共最多30单")
-    log("风控: 5倍 / 单笔保证金<=200U / 单笔亏损<=40U / 日亏<=100U / 趋势单日最多3单 / 总共日最多30单")
+    log("策略: 5m 共振（1h EMA200 + 15m ADX>23 + 5m 均线，3 选 2）+ 量能过滤；"
+        "止损 1.5 倍 ATR，止盈 2.25 倍 ATR，盈亏比 1:1.5；赚 1 倍风险保本；"
+        "进场限价单，止损市价单；冷却 15 分钟（止损后 30 分钟）；一天最多 10 单，同时最多 1 单")
+    log("风控: 10 倍 / 单笔保证金<=200U / 单笔风险目标 10U（本金 0.5%）/ 单笔亏损硬上限 40U / "
+        f"日亏熔断 {MAX_DAILY_LOSS_USDT:.0f}U / 连亏 3 单休息 1 小时 / 大消息前后 30 分钟不交易")
     if not DRY_RUN and not LIVE_TRADING_ENABLED:
         log("已拒绝启动：DRY_RUN=False 但未在 config.json 开 live_trading_enabled。")
         return
@@ -131,23 +220,40 @@ def main() -> None:
         log("实盘模式：API 凭证已加载（Secret 不打印）。")
 
     risk = RiskManager()
-    price_history: deque = deque(maxlen=MIDLINE_WINDOW_MINUTES)  # 最近 60 分钟现价，算均线和滚动分界线
-    prev_price: float | None = None
-    closes_above_long_trigger = 0  # 连续站稳 76600 的 1 分钟次数
-    closes_below_trend_short = 0  # 连续收在 75200 下方的 1 分钟次数
     stop_file = Path(__file__).resolve().parent / "STOP"
     state_file = Path(__file__).resolve().parent / "state.json"
+    position: dict | None = None
+    last_eval_candle: int | None = None
+    halted_logged = False
 
-    # 断点续跑：读回当天的已用单数 / 已亏（只做本地记录）
+    def save_state() -> None:
+        state_file.write_text(json.dumps({
+            "date": risk.current_date,
+            "trades_today": risk.trades_today,
+            "consecutive_losses": risk.consecutive_losses,
+            "daily_loss_usdt": risk.daily_loss_usdt,
+            "daily_pnl_usdt": risk.daily_pnl_usdt,
+            "last_close_at": risk.last_close_at,
+            "last_close_was_sl": risk.last_close_was_sl,
+            "pause_until": risk.pause_until,
+            "position": position,
+        }, ensure_ascii=False), encoding="utf-8")
+
+    # 断点续跑：读回当天的计数和持仓（只做本地记录）
     if state_file.exists():
         try:
             saved = json.loads(state_file.read_text(encoding="utf-8"))
-            if saved.get("date") == str(date.today()):
+            if saved.get("date") == utc_today():
                 risk.trades_today = saved.get("trades_today", 0)
-                risk.trend_trades_today = saved.get("trend_trades_today", 0)
+                risk.consecutive_losses = saved.get("consecutive_losses", 0)
                 risk.daily_loss_usdt = saved.get("daily_loss_usdt", 0.0)
-                risk.last_trade_at = {k: float(v) for k, v in saved.get("last_trade_at", {}).items()}
-                log(f"恢复今日状态: 已开 {risk.trades_today} 单 (其中趋势 {risk.trend_trades_today} 单), 今日亏损 {risk.daily_loss_usdt:.2f} U")
+                risk.daily_pnl_usdt = saved.get("daily_pnl_usdt", 0.0)
+                risk.last_close_at = saved.get("last_close_at")
+                risk.last_close_was_sl = saved.get("last_close_was_sl", False)
+                risk.pause_until = saved.get("pause_until")
+                position = saved.get("position")
+                log(f"恢复今日状态: 已开 {risk.trades_today} 单，连亏 {risk.consecutive_losses} 单，"
+                    f"今日盈亏 {risk.daily_pnl_usdt:+.2f} U，持仓: {'有' if position else '无'}")
         except Exception:  # noqa: BLE001
             pass
 
@@ -155,50 +261,95 @@ def main() -> None:
         if stop_file.exists():
             log("检测到 STOP 文件，一键停机，退出。")
             break
+
+        # UTC 日期变了就自动清零（不用重启）
+        if risk.reset_if_new_day(utc_today()):
+            halted_logged = False
+            log("UTC 日期已变，当日计数自动清零，继续交易。")
+            save_state()
+
         if risk.should_stop_for_day():
-            log("今日亏损已达 100 U 上限，停手，不再开单。")
-            break
+            if not halted_logged:
+                log(f"今日亏损已达 {MAX_DAILY_LOSS_USDT:.0f} U 熔断，停手，等 UTC 午夜自动清零。")
+                halted_logged = True
+            time.sleep(60)
+            continue
+        halted_logged = False
 
         price = get_price_dry_run()
         if price is None:
             time.sleep(60)
             continue
+        now = time.time()
 
-        if price >= LONG_TRIGGER:
-            closes_above_long_trigger += 1
-        else:
-            closes_above_long_trigger = 0
+        # ---------- 持仓管理（每分钟）----------
+        if position is not None:
+            side = position["side"]
+            entry = position["entry"]
+            risk_distance = abs(entry - position["stop_loss"])
+            stop_loss = position["stop_loss"]
+            take_profit = position["take_profit"]
 
-        if price < TREND_SHORT_TRIGGER:
-            closes_below_trend_short += 1
-        else:
-            closes_below_trend_short = 0
+            # 保本：赚到 1 倍风险就把止损移到成本价
+            if not position["breakeven_done"]:
+                if side == "LONG" and price >= entry + risk_distance:
+                    position["stop_loss"] = entry
+                    position["breakeven_done"] = True
+                    stop_loss = entry
+                    log(f"保本触发：{side} 已赚 1 倍风险，止损移到成本价 {entry:.1f}。")
+                    save_state()  # 保本后的止损要落盘，重启也不丢
+                elif side == "SHORT" and price <= entry - risk_distance:
+                    position["stop_loss"] = entry
+                    position["breakeven_done"] = True
+                    stop_loss = entry
+                    log(f"保本触发：{side} 已赚 1 倍风险，止损移到成本价 {entry:.1f}。")
+                    save_state()  # 保本后的止损要落盘，重启也不丢
 
-        price_history.append(price)
-        # 方向指标：快线（5 分钟均线）、慢线（20 分钟均线）、滚动分界线（最近 60 分钟高低点中点）
-        if len(price_history) >= MA_SLOW_PERIOD:
-            ma_fast = sum(list(price_history)[-MA_FAST_PERIOD:]) / MA_FAST_PERIOD
-            ma_slow = sum(list(price_history)[-MA_SLOW_PERIOD:]) / MA_SLOW_PERIOD
-            midline = (max(price_history) + min(price_history)) / 2
-        else:
-            ma_fast = ma_slow = midline = None  # 预热期数据不够，不过滤
-
-        signal = evaluate(price=price, prev_price=prev_price,
-                          closes_above_long_trigger=closes_above_long_trigger,
-                          closes_below_trend_short=closes_below_trend_short,
-                          ma_fast=ma_fast, ma_slow=ma_slow, midline=midline)
-        prev_price = price
-
-        if signal is None:
-            log(f"无信号，BTC 现价 {price:.1f}，继续等 1 分钟。")
+            hit_tp = (side == "LONG" and price >= take_profit) or \
+                     (side == "SHORT" and price <= take_profit)
+            hit_sl = (side == "LONG" and price <= stop_loss) or \
+                     (side == "SHORT" and price >= stop_loss)
+            if hit_tp or hit_sl:
+                was_sl = hit_sl and not position["breakeven_done"]
+                pnl = close_pnl(position, price, exit_is_maker=hit_tp)
+                kind = "止盈" if hit_tp else ("止损" if was_sl else "保本出场")
+                log(f"平仓 [{kind}]：{side} 入场 {entry:.1f} 出场 {price:.1f}，"
+                    f"本单盈亏 {pnl:+.2f} U，今日累计 {risk.daily_pnl_usdt + pnl:+.2f} U。")
+                risk.record_trade_closed(pnl, was_sl=was_sl, now=now)
+                position = None
+                save_state()
+                time.sleep(60)
+                continue
             time.sleep(60)
             continue
 
-        log(f"信号触发: {signal['side']} @ {price:.1f} 原因: {signal['reason']} 模式: {signal.get('mode', '?')}")
-        now = time.time()
-        if not risk.can_trade(mode=signal.get("mode", "small_range"),
-                              side=signal["side"], now=now):
-            log("风控拦截：今日单数（趋势单最多3单 / 总共最多30单）、亏损已达上限，或同一方向 10 分钟冷却期内，不开单。")
+        # ---------- 无持仓：等 5 分钟 K 线收盘再判断 ----------
+        indicators = compute_indicators()
+        if indicators is None:
+            time.sleep(60)
+            continue
+        if indicators["candle_open_time"] == last_eval_candle:
+            # 这根 5 分钟 K 线已经判断过，等下一根
+            log(f"无信号，BTC 现价 {price:.1f}，继续等 1 分钟。")
+            time.sleep(60)
+            continue
+        last_eval_candle = indicators["candle_open_time"]
+
+        signal = evaluate(price=indicators["price"], atr=indicators["atr"],
+                          ema200_1h=indicators["ema200_1h"], adx15=indicators["adx15"],
+                          ma_fast=indicators["ma_fast"], ma_slow=indicators["ma_slow"],
+                          midline=indicators["midline"],
+                          volume=indicators["volume"], volume_sma=indicators["volume_sma"],
+                          log=log)
+        if signal is None:
+            log(f"无信号，BTC 现价 {price:.1f}（5m 收 {indicators['price']:.1f}），继续等。")
+            time.sleep(60)
+            continue
+
+        log(f"信号触发: {signal['side']} @ {signal['entry']:.1f} 原因: {signal['reason']}")
+        ok, reason = risk.can_trade(now=now)
+        if not ok:
+            log(f"风控拦截：{reason}")
             time.sleep(60)
             continue
 
@@ -213,22 +364,21 @@ def main() -> None:
 
         if DRY_RUN:
             place_order_dry_run(signal, qty, margin_usdt)
-            # Dry-Run 下不计入真实盈亏，只计单数，避免反复刷同一信号
-            risk.record_trade_opened(mode=signal.get("mode", "small_range"),
-                                         side=signal["side"], now=now)
         else:
             place_order_live(signal, qty, margin_usdt)
-            risk.record_trade_opened(mode=signal.get("mode", "small_range"),
-                                     side=signal["side"], now=now)
-
-        state_file.write_text(json.dumps({
-            "date": str(date.today()),
-            "trades_today": risk.trades_today,
-            "trend_trades_today": risk.trend_trades_today,
-            "last_trade_at": risk.last_trade_at,
-            "daily_loss_usdt": risk.daily_loss_usdt,
-        }, ensure_ascii=False), encoding="utf-8")
-
+        risk.record_trade_opened(now=now)
+        position = {
+            "side": signal["side"],
+            "entry": signal["entry"],
+            "qty": qty,
+            "margin": margin_usdt,
+            "stop_loss": signal["stop_loss"],
+            "take_profit": signal["take_profit_1"],
+            "breakeven_done": False,
+            "opened_at": now,
+            "atr": signal.get("atr"),
+        }
+        save_state()
         time.sleep(60)
 
 
