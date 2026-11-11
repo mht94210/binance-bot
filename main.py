@@ -19,6 +19,8 @@ Binance BTC+ETH 永续合约短线机器人 —— 10 倍快进快出方案（�
 - 赚到 1 倍风险就把止损移到成本价（保本）；进场限价单，止损市价单
 - 冷却 15 分钟，止损后 30 分钟；每个币种每天最多 10 单、同时最多 1 单
   （全账户同时最多 2 单、每天最多 20 单）
+  （2026-11-11 用户决定：3/3 强信号可跳过冷却直接进场，2/3 票继续等；
+  连亏暂停、消息禁入、每日熔断是硬刹车，再强也不能跳过）
 - 熔断：一天净亏 40 U（本金 2%）停；连亏 3 单休息 1 小时；大消息前后 30 分钟不交易
 - 当日计数按 UTC 日期自动清零（2026-11-07 的教训：旧版只在重启时清零，跑着不动就一直卡在上限）
 - 入场按判断时的实时价，不用滞后的 5 分钟 K 线收盘价（2026-11-10 的教训）
@@ -406,10 +408,14 @@ def main() -> None:
                 log(f"风控拦截：同时持仓已满 {open_count} 单，不开 {symbol}。")
                 continue
 
-            ok, reason = risk.can_trade(symbol, now=now)
+            ok, reason = risk.can_trade(symbol, now=now,
+                                        votes=signal.get("votes", 0))
             if not ok:
                 log(f"风控拦截：{reason}")
                 continue
+            if reason:
+                # 3/3 强信号跳过冷却：放行，但要把原因记进日志，免得事后看不懂
+                log(f"风控放行：{reason}")
 
             qty, margin_usdt, max_loss = risk.size_position(
                 entry=signal["entry"], stop_loss=signal["stop_loss"]

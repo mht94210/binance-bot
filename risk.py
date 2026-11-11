@@ -117,8 +117,14 @@ class RiskManager:
         return True
 
     # ---------- 当日上限 ----------
-    def can_trade(self, symbol: str, now: float | None = None) -> tuple[bool, str]:
-        """返回 (能不能开单, 原因)。原因空字符串表示可以开。"""
+    def can_trade(self, symbol: str, now: float | None = None,
+                  votes: int = 0) -> tuple[bool, str]:
+        """返回 (能不能开单, 原因)。原因空字符串表示可以开。
+
+        冷却例外（2026-11-11 用户决定）：3/3 强信号可跳过冷却直接进场，
+        2/3 票的信号继续等满冷却。连亏暂停、消息禁入、每日熔断是硬刹车，
+        再强的信号也不能跳过。
+        """
         if self.trades_today.get(symbol, 0) >= MAX_TRADES_PER_DAY:
             return False, f"{symbol} 今日已开 {self.trades_today.get(symbol, 0)} 单，达到上限 {MAX_TRADES_PER_DAY} 单。"
         if self.daily_pnl_usdt <= -self.daily_loss_limit:
@@ -138,6 +144,8 @@ class RiskManager:
             if now - last_close < need:
                 left = int((need - (now - last_close)) / 60) + 1
                 kind = "止损后" if was_sl else "平仓后"
+                if votes >= 3:
+                    return True, f"3/3 强信号，跳过{symbol} {kind}冷却（本来还要等约 {left} 分钟）。"
                 return False, f"{symbol} {kind}冷却中，还要等约 {left} 分钟。"
         return True, ""
 
