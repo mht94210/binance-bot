@@ -22,6 +22,7 @@ Binance BTC+ETH 永续合约短线机器人 —— 10 倍快进快出方案（�
 - 赚到 1 倍风险就把止损移到成本价（保本）；进场限价单，止损市价单
 - 冷却 15 分钟，止损后 30 分钟；每个币种每天最多 10 单、同时最多 1 单
   （全账户同时最多 2 单、每天最多 20 单）
+  （两个币种不同时同方向持仓，2026-11-12 用户确认：大饼二饼一波行情算一回事）
   （震荡信号没有票数，不跳过冷却；连亏暂停、消息禁入、每日熔断是硬刹车）
 - 熔断：一天净亏 100 U（本金 5%）停；连亏 3 单休息 1 小时；大消息前后 30 分钟不交易
 - 当日计数按 UTC 日期自动清零（2026-11-07 的教训：旧版只在重启时清零，跑着不动就一直卡在上限）
@@ -204,6 +205,19 @@ def close_pnl(position: dict, exit_price: float, exit_is_maker: bool) -> float:
     return gross - entry_fee - exit_fee
 
 
+def same_direction_blocked(positions: dict, symbol: str, side: str) -> str | None:
+    """跨币种同方向锁：另一个币种已同方向持仓时，返回对方币种名，否则返回 None。
+
+    2026-11-12 用户确认：大饼二饼平时高度相关，一波行情会同时打掉两单
+    （11 月 12 日凌晨 BTC/ETH 同时做空、同时止损，共 -24.01U，其实是一回事）。
+    不同方向不管（比如 BTC 做空、ETH 做多可以同时存在），只挡同方向。
+    """
+    for other, pos in positions.items():
+        if other != symbol and pos is not None and pos.get("side") == side:
+            return other
+    return None
+
+
 def main() -> None:
     log("=" * 60)
     log("BTC+ETH 合约震荡机器人启动（震荡版：高空低多，2026-11-11 用户确认；和德国趋势版互补）")
@@ -211,7 +225,8 @@ def main() -> None:
     log("策略: 15m 震荡高空低多（最近 6 小时区间上下沿，ADX<25 才做，现价到上沿 25% 做空、下沿 25% 做多）；"
         "止损沿外 0.5 倍 ATR，止盈对侧沿，盈亏比约 1:2 到 1:4；赚 1 倍风险保本；"
         "进场限价单，止损市价单；冷却 15 分钟（止损后 30 分钟）；"
-        "每个币种一天最多 10 单、同时最多 1 单（全账户同时最多 2 单）")
+        "每个币种一天最多 10 单、同时最多 1 单（全账户同时最多 2 单）；"
+        "两个币种不同时同方向持仓（2026-11-12 用户确认）")
     log("风控: 10 倍 / 单笔保证金<=200U / 单笔风险目标 10U（本金 0.5%）/ 单笔亏损硬上限 40U / "
         f"日亏熔断 {MAX_DAILY_LOSS_USDT:.0f}U / 连亏 3 单休息 1 小时 / 大消息前后 30 分钟不交易")
     if not DRY_RUN and not LIVE_TRADING_ENABLED:
@@ -395,6 +410,13 @@ def main() -> None:
             open_count = sum(1 for p in positions.values() if p is not None)
             if open_count >= MAX_OPEN_POSITIONS * len(SYMBOLS):
                 log(f"风控拦截：同时持仓已满 {open_count} 单，不开 {symbol}。")
+                continue
+
+            # 跨币种同方向锁：另一个币种已同方向持仓，不同时同方向开单
+            # （2026-11-12 用户确认：大饼二饼一波行情算一回事，同方向双开等于双倍亏）
+            other = same_direction_blocked(positions, symbol, signal["side"])
+            if other is not None:
+                log(f"信号被挡：{other} 已同方向持仓 {signal['side']}，不同时同方向开单。")
                 continue
 
             ok, reason = risk.can_trade(symbol, now=now,
