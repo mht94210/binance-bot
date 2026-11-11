@@ -1,7 +1,7 @@
 """风控器：所有开单决定都要先过它。没有止损止盈的单，一律拒绝。
 
 计数按币种分开（BTC 和 ETH 各算各的：每天各最多 10 单、冷却、连亏暂停都按币种算）；
-盈亏按账户合起来算（每天净亏 -40U 熔断是整个账户的）。
+盈亏按账户合起来算（每天净亏 -100U 熔断是整个账户的）。
 """
 from datetime import datetime, timezone
 
@@ -60,13 +60,13 @@ class RiskManager:
         self.daily_loss_usdt = 0.0
         self.daily_pnl_usdt = 0.0
         self.current_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        # 当日熔断线（正常 40 U；state.json 丢失且非 UTC 日初启动时收紧到 20 U，见 apply_conservative_halt）
+        # 当日熔断线（正常 100 U；state.json 丢失且非 UTC 日初启动时收紧到 50 U，见 apply_conservative_halt）
         self.daily_loss_limit = MAX_DAILY_LOSS_USDT
 
     def apply_conservative_halt(self) -> float:
         """state.json 丢失且不是 UTC 日初：当日计数可能已被容器重启清零，
-        把当日熔断线收紧一半（40 U -> 20 U），免得今天实际亏超 40 U。
-        UTC 午夜 reset_if_new_day 会恢复 40 U。返回收紧后的熔断线。"""
+        把当日熔断线收紧一半（100 U -> 50 U），免得今天实际亏超 100 U。
+        UTC 午夜 reset_if_new_day 会恢复 100 U。返回收紧后的熔断线。"""
         self.daily_loss_limit = CONSERVATIVE_DAILY_LOSS_USDT
         return self.daily_loss_limit
 
@@ -91,8 +91,8 @@ class RiskManager:
             setattr(self, key, {s: int(src.get(s, 0)) for s in self.symbols})
         self.daily_loss_usdt = float(saved.get("daily_loss_usdt", 0.0))
         self.daily_pnl_usdt = float(saved.get("daily_pnl_usdt", 0.0))
-        # 熔断线也恢复（收紧过的 20 U 不能因一次进程重启就悄悄变回 40 U）；
-        # 旧 state.json 没有这个字段时默认 40 U。
+        # 熔断线也恢复（收紧过的 50 U 不能因一次进程重启就悄悄变回 100 U）；
+        # 旧 state.json 没有这个字段时默认 100 U。
         self.daily_loss_limit = float(saved.get("daily_loss_limit", MAX_DAILY_LOSS_USDT))
         for key in ("last_close_at", "pause_until"):
             src = saved.get(key) or {}
@@ -110,7 +110,7 @@ class RiskManager:
         self.consecutive_losses = {s: 0 for s in self.symbols}
         self.daily_loss_usdt = 0.0
         self.daily_pnl_usdt = 0.0
-        self.daily_loss_limit = MAX_DAILY_LOSS_USDT  # 新的一天，熔断线恢复 40 U
+        self.daily_loss_limit = MAX_DAILY_LOSS_USDT  # 新的一天，熔断线恢复 100 U
         self.last_close_at = {s: None for s in self.symbols}
         self.last_close_was_sl = {s: False for s in self.symbols}
         self.pause_until = {s: None for s in self.symbols}
