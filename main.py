@@ -66,7 +66,7 @@ def _start_health_server():
     class H(BaseHTTPRequestHandler):
         def do_GET(self):
             self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
             try:
                 # 双币种后日志翻倍，留 16000 字符（约 24 分钟心跳），和单币种 8000 字符覆盖一样长
