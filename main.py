@@ -35,9 +35,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config import (
     ADX_PERIOD,
     ATR_PERIOD,
+    CONSERVATIVE_DAILY_LOSS_USDT,
     DATA_BASE_URL,
     DRY_RUN,
     EMA_PERIOD_1H,
+    FLAT_POLL_SECONDS,
+    HEARTBEAT_LOG_SECONDS,
+    HOLDING_POLL_SECONDS,
     LIVE_TRADING_ENABLED,
     MA_FAST_PERIOD,
     MA_SLOW_PERIOD,
@@ -73,6 +77,7 @@ def _start_health_server():
         def log_message(self, *a): pass
     threading.Thread(target=lambda: HTTPServer(("0.0.0.0", _port), H).serve_forever(), daemon=True).start()
 _start_health_server()
+
 
 
 
@@ -230,6 +235,10 @@ def main() -> None:
     positions: dict[str, dict | None] = {s: None for s in SYMBOLS}
     last_eval_candle: dict[str, int | None] = {s: None for s in SYMBOLS}
     halted_logged = False
+    # 持仓时主循环 5 秒一轮：空仓币种每 60 秒最多判断一次（否则每 5 秒拉 3 组 K 线、刷屏日志）；
+    # 持仓心跳每 20 秒记一行（止损每 5 秒都查，只是不每轮都写日志）。
+    last_flat_eval: dict[str, float] = {s: 0.0 for s in SYMBOLS}
+    last_heartbeat_log: dict[str, float] = {s: 0.0 for s in SYMBOLS}
 
     def save_state() -> None:
         state_file.write_text(json.dumps({
@@ -263,6 +272,14 @@ def main() -> None:
         # 丢了当日熔断计数就从 0 开始（2026-11-10 晚就重置过两次），
         # 必须在日志里留一句，免得静默重置后多亏。
         log("未找到 state.json：当日计数从 0 开始（首次启动，或容器重启导致状态丢失；注意当日熔断计数可能已重置）。")
+        # 如果不是 UTC 日初（00:00-01:00），很可能是容器中途重启，今天前面可能已经亏过钱，
+        # 计数丢了就看不出来：把当日熔断线收紧一半（40 U -> 20 U）兜底，UTC 午夜自动恢复 40 U。
+        _utc_hour = datetime.now(timezone.utc).hour
+        if _utc_hour >= 1:
+            risk.apply_conservative_halt()
+            log(f"状态丢失且现在是 UTC 当天 {_utc_hour:02d} 点（非日初）：今日熔断线从 "
+                f"{MAX_DAILY_LOSS_USDT:.0f} U 收紧到 {CONSERVATIVE_DAILY_LOSS_USDT:.0f} U，"
+                f"免得今天实际亏超 {MAX_DAILY_LOSS_USDT:.0f} U；UTC 午夜自动恢复。")
 
     # 启动预热：跳过当前这根 5 分钟 K 线，等下一根收盘再判断，
     # 避免重启后几秒钟就按一根快收完的 K 线立即开单。
@@ -291,7 +308,7 @@ def main() -> None:
 
         if risk.should_stop_for_day():
             if not halted_logged:
-                log(f"今日净亏损已达 {MAX_DAILY_LOSS_USDT:.0f} U 熔断，停手，等 UTC 午夜自动清零。")
+                log(f"今日净亏损已达 {risk.daily_loss_limit:.0f} U 熔断，停手，等 UTC 午夜自动清零。")
                 halted_logged = True
             time.sleep(60)
             continue
@@ -306,7 +323,7 @@ def main() -> None:
                 continue
             position = positions[symbol]
 
-            # ---------- 持仓管理（持仓时每 20 秒查一次止盈/止损/保本）----------
+            # ---------- 持仓管理（持仓时每 5 秒查一次止盈/止损/保本）----------
             if position is not None:
                 any_holding = True
                 side = position["side"]
@@ -344,15 +361,21 @@ def main() -> None:
                     positions[symbol] = None
                     save_state()
                     continue
-                # 持仓心跳：持仓时每 20 秒记一行，证明循环活着；止损/止盈/保本也查得更勤，
-                # 避免 1 分钟才查一次错过价格尖峰
-                float_pnl = (price - entry) * position["qty"] if side == "LONG" else (entry - price) * position["qty"]
-                log(f"持仓中：{symbol} {side} @{entry:.1f}，现价 {price:.1f}，浮盈 {float_pnl:+.2f} U，"
-                    f"止损 {stop_loss:.1f}，止盈 {take_profit:.1f}，"
-                    f"保本{'已移' if position['breakeven_done'] else '未触发'}。")
+                # 持仓心跳：止损/止盈/保本每 5 秒都查，但日志每 20 秒记一行，
+                # 免得 5 秒一行把日志页尾部刷满；价格尖峰 5 秒内就能抓住。
+                if now - last_heartbeat_log[symbol] >= HEARTBEAT_LOG_SECONDS:
+                    last_heartbeat_log[symbol] = now
+                    float_pnl = (price - entry) * position["qty"] if side == "LONG" else (entry - price) * position["qty"]
+                    log(f"持仓中：{symbol} {side} @{entry:.1f}，现价 {price:.1f}，浮盈 {float_pnl:+.2f} U，"
+                        f"止损 {stop_loss:.1f}，止盈 {take_profit:.1f}，"
+                        f"保本{'已移' if position['breakeven_done'] else '未触发'}。")
                 continue
 
             # ---------- 无持仓：等 5 分钟 K 线收盘再判断 ----------
+            # 持仓时主循环 5 秒一轮，空仓币种不能每 5 秒拉 3 组 K 线：60 秒最多判断一次。
+            if now - last_flat_eval[symbol] < 55:
+                continue
+            last_flat_eval[symbol] = now
             indicators = compute_indicators(symbol)
             if indicators is None:
                 continue
@@ -421,8 +444,8 @@ def main() -> None:
             }
             save_state()
 
-        # 有持仓时 20 秒一轮（止损查得勤），没持仓时 60 秒一轮
-        time.sleep(20 if any_holding else 60)
+        # 有持仓时 5 秒一轮（止损查得勤，滑点小），没持仓时 60 秒一轮
+        time.sleep(HOLDING_POLL_SECONDS if any_holding else FLAT_POLL_SECONDS)
 
 
 if __name__ == "__main__":

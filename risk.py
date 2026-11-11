@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 
 from config import (
     ACCOUNT_SIZE_USDT,
+    CONSERVATIVE_DAILY_LOSS_USDT,
     CONSECUTIVE_LOSS_PAUSE_MINUTES,
     COOLDOWN_AFTER_SL_MINUTES,
     COOLDOWN_MINUTES,
@@ -59,6 +60,15 @@ class RiskManager:
         self.daily_loss_usdt = 0.0
         self.daily_pnl_usdt = 0.0
         self.current_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        # 当日熔断线（正常 40 U；state.json 丢失且非 UTC 日初启动时收紧到 20 U，见 apply_conservative_halt）
+        self.daily_loss_limit = MAX_DAILY_LOSS_USDT
+
+    def apply_conservative_halt(self) -> float:
+        """state.json 丢失且不是 UTC 日初：当日计数可能已被容器重启清零，
+        把当日熔断线收紧一半（40 U -> 20 U），免得今天实际亏超 40 U。
+        UTC 午夜 reset_if_new_day 会恢复 40 U。返回收紧后的熔断线。"""
+        self.daily_loss_limit = CONSERVATIVE_DAILY_LOSS_USDT
+        return self.daily_loss_limit
 
     # ---------- 状态存取（给 state.json 用）----------
     def state_dict(self) -> dict:
@@ -68,6 +78,7 @@ class RiskManager:
             "consecutive_losses": dict(self.consecutive_losses),
             "daily_loss_usdt": self.daily_loss_usdt,
             "daily_pnl_usdt": self.daily_pnl_usdt,
+            "daily_loss_limit": self.daily_loss_limit,
             "last_close_at": dict(self.last_close_at),
             "last_close_was_sl": dict(self.last_close_was_sl),
             "pause_until": dict(self.pause_until),
@@ -80,6 +91,9 @@ class RiskManager:
             setattr(self, key, {s: int(src.get(s, 0)) for s in self.symbols})
         self.daily_loss_usdt = float(saved.get("daily_loss_usdt", 0.0))
         self.daily_pnl_usdt = float(saved.get("daily_pnl_usdt", 0.0))
+        # 熔断线也恢复（收紧过的 20 U 不能因一次进程重启就悄悄变回 40 U）；
+        # 旧 state.json 没有这个字段时默认 40 U。
+        self.daily_loss_limit = float(saved.get("daily_loss_limit", MAX_DAILY_LOSS_USDT))
         for key in ("last_close_at", "pause_until"):
             src = saved.get(key) or {}
             setattr(self, key, {s: src.get(s) for s in self.symbols})
@@ -96,6 +110,7 @@ class RiskManager:
         self.consecutive_losses = {s: 0 for s in self.symbols}
         self.daily_loss_usdt = 0.0
         self.daily_pnl_usdt = 0.0
+        self.daily_loss_limit = MAX_DAILY_LOSS_USDT  # 新的一天，熔断线恢复 40 U
         self.last_close_at = {s: None for s in self.symbols}
         self.last_close_was_sl = {s: False for s in self.symbols}
         self.pause_until = {s: None for s in self.symbols}
@@ -106,8 +121,8 @@ class RiskManager:
         """返回 (能不能开单, 原因)。原因空字符串表示可以开。"""
         if self.trades_today.get(symbol, 0) >= MAX_TRADES_PER_DAY:
             return False, f"{symbol} 今日已开 {self.trades_today.get(symbol, 0)} 单，达到上限 {MAX_TRADES_PER_DAY} 单。"
-        if self.daily_pnl_usdt <= -MAX_DAILY_LOSS_USDT:
-            return False, f"今日净盈亏 {self.daily_pnl_usdt:.2f} U，达到熔断 -{MAX_DAILY_LOSS_USDT:.0f} U。"
+        if self.daily_pnl_usdt <= -self.daily_loss_limit:
+            return False, f"今日净盈亏 {self.daily_pnl_usdt:.2f} U，达到熔断 -{self.daily_loss_limit:.0f} U。"
         if now is None:
             return True, ""
         if self.pause_until.get(symbol) is not None and now < self.pause_until[symbol]:
@@ -127,7 +142,7 @@ class RiskManager:
         return True, ""
 
     def should_stop_for_day(self) -> bool:
-        return self.daily_pnl_usdt <= -MAX_DAILY_LOSS_USDT
+        return self.daily_pnl_usdt <= -self.daily_loss_limit
 
     def record_trade_opened(self, symbol: str, now: float | None = None) -> None:
         self.trades_today[symbol] = self.trades_today.get(symbol, 0) + 1
