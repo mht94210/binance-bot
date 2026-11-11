@@ -1,4 +1,8 @@
-"""风控器：所有开单决定都要先过它。没有止损止盈的单，一律拒绝。"""
+"""风控器：所有开单决定都要先过它。没有止损止盈的单，一律拒绝。
+
+计数按币种分开（BTC 和 ETH 各算各的：每天各最多 10 单、冷却、连亏暂停都按币种算）；
+盈亏按账户合起来算（每天净亏 -40U 熔断是整个账户的）。
+"""
 from datetime import datetime, timezone
 
 from config import (
@@ -16,7 +20,6 @@ from config import (
     NEWS_PAUSE_WINDOWS,
     RISK_PER_TRADE_PCT,
     TAKER_FEE_PCT,
-    TARGET_LOSS_PER_TRADE_USDT,
 )
 
 
@@ -44,15 +47,44 @@ def is_news_pause(now: float) -> bool:
 
 
 class RiskManager:
-    def __init__(self) -> None:
-        self.trades_today = 0
-        self.consecutive_losses = 0
+    def __init__(self, symbols: list[str]) -> None:
+        self.symbols = list(symbols)
+        # 按币种各算各的
+        self.trades_today: dict[str, int] = {s: 0 for s in self.symbols}
+        self.consecutive_losses: dict[str, int] = {s: 0 for s in self.symbols}
+        self.last_close_at: dict[str, float | None] = {s: None for s in self.symbols}
+        self.last_close_was_sl: dict[str, bool] = {s: False for s in self.symbols}
+        self.pause_until: dict[str, float | None] = {s: None for s in self.symbols}
+        # 全账户合起来算
         self.daily_loss_usdt = 0.0
         self.daily_pnl_usdt = 0.0
-        self.last_close_at: float | None = None   # 上次平仓时间戳（秒）
-        self.last_close_was_sl = False            # 上次平仓是不是止损
-        self.pause_until: float | None = None     # 连亏熔断的暂停结束时间
         self.current_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # ---------- 状态存取（给 state.json 用）----------
+    def state_dict(self) -> dict:
+        """返回可存进 state.json 的当日状态。"""
+        return {
+            "trades_today": dict(self.trades_today),
+            "consecutive_losses": dict(self.consecutive_losses),
+            "daily_loss_usdt": self.daily_loss_usdt,
+            "daily_pnl_usdt": self.daily_pnl_usdt,
+            "last_close_at": dict(self.last_close_at),
+            "last_close_was_sl": dict(self.last_close_was_sl),
+            "pause_until": dict(self.pause_until),
+        }
+
+    def restore_state(self, saved: dict) -> None:
+        """从 state.json 恢复当日计数；缺的币种默认 0，不报错。"""
+        for key in ("trades_today", "consecutive_losses"):
+            src = saved.get(key) or {}
+            setattr(self, key, {s: int(src.get(s, 0)) for s in self.symbols})
+        self.daily_loss_usdt = float(saved.get("daily_loss_usdt", 0.0))
+        self.daily_pnl_usdt = float(saved.get("daily_pnl_usdt", 0.0))
+        for key in ("last_close_at", "pause_until"):
+            src = saved.get(key) or {}
+            setattr(self, key, {s: src.get(s) for s in self.symbols})
+        src = saved.get("last_close_was_sl") or {}
+        self.last_close_was_sl = {s: bool(src.get(s, False)) for s in self.symbols}
 
     # ---------- 日期清零（2026-11-07 的教训：旧版只在重启时清零，跑着不动就一直卡在 30 单上限）----------
     def reset_if_new_day(self, utc_date: str) -> bool:
@@ -60,63 +92,65 @@ class RiskManager:
         if utc_date == self.current_date:
             return False
         self.current_date = utc_date
-        self.trades_today = 0
-        self.consecutive_losses = 0
+        self.trades_today = {s: 0 for s in self.symbols}
+        self.consecutive_losses = {s: 0 for s in self.symbols}
         self.daily_loss_usdt = 0.0
         self.daily_pnl_usdt = 0.0
-        self.last_close_at = None
-        self.last_close_was_sl = False
-        self.pause_until = None
+        self.last_close_at = {s: None for s in self.symbols}
+        self.last_close_was_sl = {s: False for s in self.symbols}
+        self.pause_until = {s: None for s in self.symbols}
         return True
 
     # ---------- 当日上限 ----------
-    def can_trade(self, now: float | None = None) -> tuple[bool, str]:
+    def can_trade(self, symbol: str, now: float | None = None) -> tuple[bool, str]:
         """返回 (能不能开单, 原因)。原因空字符串表示可以开。"""
-        if self.trades_today >= MAX_TRADES_PER_DAY:
-            return False, f"今日已开 {self.trades_today} 单，达到上限 {MAX_TRADES_PER_DAY} 单。"
+        if self.trades_today.get(symbol, 0) >= MAX_TRADES_PER_DAY:
+            return False, f"{symbol} 今日已开 {self.trades_today.get(symbol, 0)} 单，达到上限 {MAX_TRADES_PER_DAY} 单。"
         if self.daily_pnl_usdt <= -MAX_DAILY_LOSS_USDT:
             return False, f"今日净盈亏 {self.daily_pnl_usdt:.2f} U，达到熔断 -{MAX_DAILY_LOSS_USDT:.0f} U。"
         if now is None:
             return True, ""
-        if self.pause_until is not None and now < self.pause_until:
-            left = int((self.pause_until - now) / 60)
-            return False, f"连亏 {MAX_CONSECUTIVE_LOSSES} 单熔断中，还要休息约 {left} 分钟。"
+        if self.pause_until.get(symbol) is not None and now < self.pause_until[symbol]:
+            left = int((self.pause_until[symbol] - now) / 60)
+            return False, f"{symbol} 连亏 {MAX_CONSECUTIVE_LOSSES} 单熔断中，还要休息约 {left} 分钟。"
         if is_news_pause(now):
             return False, "大消息禁入窗口内（CPI / 非农 / FOMC 前后 30 分钟），不交易。"
-        if self.last_close_at is not None:
-            need = (COOLDOWN_AFTER_SL_MINUTES if self.last_close_was_sl
+        last_close = self.last_close_at.get(symbol)
+        if last_close is not None:
+            was_sl = self.last_close_was_sl.get(symbol, False)
+            need = (COOLDOWN_AFTER_SL_MINUTES if was_sl
                     else COOLDOWN_MINUTES) * 60
-            if now - self.last_close_at < need:
-                left = int((need - (now - self.last_close_at)) / 60) + 1
-                kind = "止损后" if self.last_close_was_sl else "平仓后"
-                return False, f"{kind}冷却中，还要等约 {left} 分钟。"
+            if now - last_close < need:
+                left = int((need - (now - last_close)) / 60) + 1
+                kind = "止损后" if was_sl else "平仓后"
+                return False, f"{symbol} {kind}冷却中，还要等约 {left} 分钟。"
         return True, ""
 
     def should_stop_for_day(self) -> bool:
         return self.daily_pnl_usdt <= -MAX_DAILY_LOSS_USDT
 
-    def record_trade_opened(self, now: float | None = None) -> None:
-        self.trades_today += 1
+    def record_trade_opened(self, symbol: str, now: float | None = None) -> None:
+        self.trades_today[symbol] = self.trades_today.get(symbol, 0) + 1
 
-    def record_trade_closed(self, pnl_usdt: float, was_sl: bool, now: float | None = None) -> None:
-        """平仓后调用：更新当日盈亏、连亏计数、冷却时间。"""
+    def record_trade_closed(self, symbol: str, pnl_usdt: float, was_sl: bool, now: float | None = None) -> None:
+        """平仓后调用：更新当日盈亏（全账户）、连亏计数和冷却时间（按币种）。"""
         self.daily_pnl_usdt += pnl_usdt
         if pnl_usdt < 0:
             self.daily_loss_usdt += -pnl_usdt
-            self.consecutive_losses += 1
+            self.consecutive_losses[symbol] = self.consecutive_losses.get(symbol, 0) + 1
         else:
-            self.consecutive_losses = 0
+            self.consecutive_losses[symbol] = 0
         if now is not None:
-            self.last_close_at = now
-            self.last_close_was_sl = was_sl
-            if self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
-                self.pause_until = now + CONSECUTIVE_LOSS_PAUSE_MINUTES * 60
+            self.last_close_at[symbol] = now
+            self.last_close_was_sl[symbol] = was_sl
+            if self.consecutive_losses.get(symbol, 0) >= MAX_CONSECUTIVE_LOSSES:
+                self.pause_until[symbol] = now + CONSECUTIVE_LOSS_PAUSE_MINUTES * 60
 
     # ---------- 仓位计算 ----------
     def size_position(self, entry: float, stop_loss: float) -> tuple[float, float, float]:
         """
         按风险倒推仓位：名义仓位 = 每单风险额 / 止损距离%，保证金封顶 200 U。
-        每单风险额 = 本金 x 0.5%（10 U）。返回 (数量 BTC, 保证金 USDT, 预期最大亏损 USDT)。
+        每单风险额 = 本金 x 0.5%（10 U）。返回 (数量, 保证金 USDT, 预期最大亏损 USDT)。
         预期最大亏损按 Taker 手续费保守估算；超 40 U 硬上限返回数量 0，放弃这单。
         """
         stop_distance = abs(entry - stop_loss)

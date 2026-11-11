@@ -1,7 +1,8 @@
 """
-Binance BTCUSDT 永续合约短线机器人 —— 10 倍快进快出方案（默认 Dry-Run，不下真实单）
+Binance BTC+ETH 永续合约短线机器人 —— 10 倍快进快出方案（默认 Dry-Run，不下真实单）
 
 版本：2026-11-10 用户确认（综合 3Commas / Cryptohopper / Pionex / Freqtrade 等做法后定）。
+2026-11-11 用户确认加 ETHUSDT，双币种同规则各跑各的。
 
 安全原则：
 - 默认 DRY_RUN = True：只看行情、只记录“本来会下的单”，绝不调下单接口。
@@ -16,9 +17,11 @@ Binance BTCUSDT 永续合约短线机器人 —— 10 倍快进快出方案（�
 - 信号：5 分钟 K 线收盘时判断（1 小时 EMA200 定方向 + 15 分钟 ADX>23 + 5 分钟均线，3 选 2）
 - 止损 1.5 倍 ATR，止盈 2.25 倍 ATR，盈亏比 1:1.5；止盈目标 < 0.30% 不做
 - 赚到 1 倍风险就把止损移到成本价（保本）；进场限价单，止损市价单
-- 冷却 15 分钟，止损后 30 分钟；每天最多 10 单，同时最多 1 单
-- 熔断：一天亏 40 U（本金 2%）停；连亏 3 单休息 1 小时；大消息前后 30 分钟不交易
+- 冷却 15 分钟，止损后 30 分钟；每个币种每天最多 10 单、同时最多 1 单
+  （全账户同时最多 2 单、每天最多 20 单）
+- 熔断：一天净亏 40 U（本金 2%）停；连亏 3 单休息 1 小时；大消息前后 30 分钟不交易
 - 当日计数按 UTC 日期自动清零（2026-11-07 的教训：旧版只在重启时清零，跑着不动就一直卡在上限）
+- 入场按判断时的实时价，不用滞后的 5 分钟 K 线收盘价（2026-11-10 的教训）
 """
 import json
 import os
@@ -40,8 +43,8 @@ from config import (
     MA_SLOW_PERIOD,
     MAKER_FEE_PCT,
     MAX_DAILY_LOSS_USDT,
-    MAX_TRADES_PER_DAY,
-    SYMBOL,
+    MAX_OPEN_POSITIONS,
+    SYMBOLS,
     TAKER_FEE_PCT,
     VOL_SMA_PERIOD,
     load_api_credentials,
@@ -62,7 +65,8 @@ def _start_health_server():
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
             try:
-                log_text = Path(__file__).resolve().parent.joinpath("bot.log").read_text(encoding="utf-8")[-8000:]
+                # 双币种后日志翻倍，留 16000 字符（约 24 分钟心跳），和单币种 8000 字符覆盖一样长
+                log_text = Path(__file__).resolve().parent.joinpath("bot.log").read_text(encoding="utf-8")[-16000:]
             except Exception:
                 log_text = "(no log yet)"
             self.wfile.write(f"Binance bot dry-run alive\n\n{log_text}".encode())
@@ -97,9 +101,9 @@ def _http_get(path: str, params: dict) -> object | None:
         return None
 
 
-def get_price_dry_run() -> float | None:
+def get_price_dry_run(symbol: str) -> float | None:
     """现价（ticker）。"""
-    data = _http_get("/fapi/v1/ticker/price", {"symbol": SYMBOL})
+    data = _http_get("/fapi/v1/ticker/price", {"symbol": symbol})
     if not isinstance(data, dict) or "price" not in data:
         return None
     try:
@@ -108,10 +112,10 @@ def get_price_dry_run() -> float | None:
         return None
 
 
-def get_klines(interval: str, limit: int) -> list[dict]:
+def get_klines(symbol: str, interval: str, limit: int) -> list[dict]:
     """K 线：返回已收盘 + 未收盘的全部 K 线（调用方自己去掉最后一根未收盘的）。
     每根：{"open_time","open","high","low","close","volume"}。"""
-    data = _http_get("/fapi/v1/klines", {"symbol": SYMBOL, "interval": interval, "limit": limit})
+    data = _http_get("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
     if not isinstance(data, list):
         return []
     out = []
@@ -130,14 +134,14 @@ def get_klines(interval: str, limit: int) -> list[dict]:
     return out
 
 
-def compute_indicators() -> dict | None:
+def compute_indicators(symbol: str) -> dict | None:
     """拉三组 K 线，算出信号要用的全部指标。失败返回 None。
     只用已收盘的 K 线（去掉每组最后一根未收盘的）。"""
-    k5 = get_klines("5m", 40)
-    k15 = get_klines("15m", 40)
-    k1h = get_klines("1h", 210)
+    k5 = get_klines(symbol, "5m", 40)
+    k15 = get_klines(symbol, "15m", 40)
+    k1h = get_klines(symbol, "1h", 210)
     if len(k5) < ATR_PERIOD + 2 or len(k15) < ADX_PERIOD * 2 + 1 or len(k1h) < EMA_PERIOD_1H + 1:
-        log("K 线不够，指标算不出来，等下一根 5 分钟 K 线。")
+        log(f"{symbol} K 线不够，指标算不出来，等下一根 5 分钟 K 线。")
         return None
     closed5 = k5[:-1]
     closed15 = k15[:-1]
@@ -169,7 +173,7 @@ def place_order_dry_run(signal: dict, qty: float, margin_usdt: float) -> None:
     """Dry-Run：只记录，不下单。"""
     log(
         "[DRY-RUN] 本来会下单: "
-        f"{signal['side']} {SYMBOL} qty={qty:.5f} 保证金={margin_usdt:.2f} USDT "
+        f"{signal['side']} {signal.get('symbol', '?')} qty={qty:.5f} 保证金={margin_usdt:.2f} USDT "
         f"入场~{signal['entry']:.1f} 止损={signal['stop_loss']:.1f} "
         f"止盈={signal['take_profit_1']:.1f} "
         f"预期最大亏损={signal['max_loss_usdt']:.2f} USDT | {signal['reason']}"
@@ -205,11 +209,12 @@ def close_pnl(position: dict, exit_price: float, exit_is_maker: bool) -> float:
 
 def main() -> None:
     log("=" * 60)
-    log("BTCUSDT 合约短线机器人启动（10 倍快进快出方案，2026-11-10 用户确认）")
-    log(f"标的: {SYMBOL} | Dry-Run: {DRY_RUN} | 实盘开关: {LIVE_TRADING_ENABLED}")
+    log("BTC+ETH 合约短线机器人启动（10 倍快进快出方案，2026-11-10 用户确认；2026-11-11 加 ETH）")
+    log(f"标的: {', '.join(SYMBOLS)} | Dry-Run: {DRY_RUN} | 实盘开关: {LIVE_TRADING_ENABLED}")
     log("策略: 5m 共振（1h EMA200 + 15m ADX>23 + 5m 均线，3 选 2）+ 量能过滤；"
         "止损 1.5 倍 ATR，止盈 2.25 倍 ATR，盈亏比 1:1.5；赚 1 倍风险保本；"
-        "进场限价单，止损市价单；冷却 15 分钟（止损后 30 分钟）；一天最多 10 单，同时最多 1 单")
+        "进场限价单，止损市价单；冷却 15 分钟（止损后 30 分钟）；"
+        "每个币种一天最多 10 单、同时最多 1 单（全账户同时最多 2 单）")
     log("风控: 10 倍 / 单笔保证金<=200U / 单笔风险目标 10U（本金 0.5%）/ 单笔亏损硬上限 40U / "
         f"日亏熔断 {MAX_DAILY_LOSS_USDT:.0f}U / 连亏 3 单休息 1 小时 / 大消息前后 30 分钟不交易")
     if not DRY_RUN and not LIVE_TRADING_ENABLED:
@@ -219,24 +224,18 @@ def main() -> None:
         load_api_credentials()  # 校验 Key 存在，不打印 Secret
         log("实盘模式：API 凭证已加载（Secret 不打印）。")
 
-    risk = RiskManager()
+    risk = RiskManager(SYMBOLS)
     stop_file = Path(__file__).resolve().parent / "STOP"
     state_file = Path(__file__).resolve().parent / "state.json"
-    position: dict | None = None
-    last_eval_candle: int | None = None
+    positions: dict[str, dict | None] = {s: None for s in SYMBOLS}
+    last_eval_candle: dict[str, int | None] = {s: None for s in SYMBOLS}
     halted_logged = False
 
     def save_state() -> None:
         state_file.write_text(json.dumps({
             "date": risk.current_date,
-            "trades_today": risk.trades_today,
-            "consecutive_losses": risk.consecutive_losses,
-            "daily_loss_usdt": risk.daily_loss_usdt,
-            "daily_pnl_usdt": risk.daily_pnl_usdt,
-            "last_close_at": risk.last_close_at,
-            "last_close_was_sl": risk.last_close_was_sl,
-            "pause_until": risk.pause_until,
-            "position": position,
+            **risk.state_dict(),
+            "positions": positions,
         }, ensure_ascii=False), encoding="utf-8")
 
     # 断点续跑：持仓不论日期都恢复（跨 UTC 午夜重启也不丢单）；
@@ -244,32 +243,40 @@ def main() -> None:
     if state_file.exists():
         try:
             saved = json.loads(state_file.read_text(encoding="utf-8"))
-            position = saved.get("position")
+            positions = {s: (saved.get("positions") or {}).get(s) for s in SYMBOLS}
             if saved.get("date") == utc_today():
-                risk.trades_today = saved.get("trades_today", 0)
-                risk.consecutive_losses = saved.get("consecutive_losses", 0)
-                risk.daily_loss_usdt = saved.get("daily_loss_usdt", 0.0)
-                risk.daily_pnl_usdt = saved.get("daily_pnl_usdt", 0.0)
-                risk.last_close_at = saved.get("last_close_at")
-                risk.last_close_was_sl = saved.get("last_close_was_sl", False)
-                risk.pause_until = saved.get("pause_until")
-                log(f"恢复今日状态: 已开 {risk.trades_today} 单，连亏 {risk.consecutive_losses} 单，"
-                    f"今日盈亏 {risk.daily_pnl_usdt:+.2f} U，持仓: {'有' if position else '无'}")
-            elif position:
-                log(f"跨日重启：恢复未平持仓 {position['side']} @{position['entry']:.1f}，"
-                    f"今日计数从 0 开始。")
+                risk.restore_state(saved)
+                detail = "；".join(
+                    f"{s} 已开 {risk.trades_today[s]} 单、持仓 {'有' if positions[s] else '无'}"
+                    for s in SYMBOLS
+                )
+                log(f"恢复今日状态: 今日盈亏 {risk.daily_pnl_usdt:+.2f} U；{detail}")
+            else:
+                for s in SYMBOLS:
+                    if positions[s]:
+                        log(f"跨日重启：恢复未平持仓 {s} {positions[s]['side']} "
+                            f"@{positions[s]['entry']:.1f}，今日计数从 0 开始。")
         except Exception:  # noqa: BLE001
             pass
+    else:
+        # state.json 只存在容器本地文件里，Cloady 重新部署/重启容器会丢；
+        # 丢了当日熔断计数就从 0 开始（2026-11-10 晚就重置过两次），
+        # 必须在日志里留一句，免得静默重置后多亏。
+        log("未找到 state.json：当日计数从 0 开始（首次启动，或容器重启导致状态丢失；注意当日熔断计数可能已重置）。")
 
     # 启动预热：跳过当前这根 5 分钟 K 线，等下一根收盘再判断，
     # 避免重启后几秒钟就按一根快收完的 K 线立即开单。
-    try:
-        _warm = compute_indicators()
-        if _warm is not None:
-            last_eval_candle = _warm["candle_open_time"]
-            log("启动预热：已跳过当前 5 分钟 K 线，等下一根收盘再判断。")
-    except Exception:  # noqa: BLE001
-        pass
+    _warmed = False
+    for symbol in SYMBOLS:
+        try:
+            _warm = compute_indicators(symbol)
+            if _warm is not None:
+                last_eval_candle[symbol] = _warm["candle_open_time"]
+                _warmed = True
+        except Exception:  # noqa: BLE001
+            pass
+    if _warmed:
+        log("启动预热：已跳过当前 5 分钟 K 线，等下一根收盘再判断。")
 
     while True:
         if stop_file.exists():
@@ -290,126 +297,132 @@ def main() -> None:
             continue
         halted_logged = False
 
-        price = get_price_dry_run()
-        if price is None:
-            time.sleep(60)
-            continue
         now = time.time()
+        any_holding = False
 
-        # ---------- 持仓管理（每分钟）----------
-        if position is not None:
-            side = position["side"]
-            entry = position["entry"]
-            risk_distance = abs(entry - position["stop_loss"])
-            stop_loss = position["stop_loss"]
-            take_profit = position["take_profit"]
-
-            # 保本：赚到 1 倍风险就把止损移到成本价
-            if not position["breakeven_done"]:
-                if side == "LONG" and price >= entry + risk_distance:
-                    position["stop_loss"] = entry
-                    position["breakeven_done"] = True
-                    stop_loss = entry
-                    log(f"保本触发：{side} 已赚 1 倍风险，止损移到成本价 {entry:.1f}。")
-                    save_state()  # 保本后的止损要落盘，重启也不丢
-                elif side == "SHORT" and price <= entry - risk_distance:
-                    position["stop_loss"] = entry
-                    position["breakeven_done"] = True
-                    stop_loss = entry
-                    log(f"保本触发：{side} 已赚 1 倍风险，止损移到成本价 {entry:.1f}。")
-                    save_state()  # 保本后的止损要落盘，重启也不丢
-
-            hit_tp = (side == "LONG" and price >= take_profit) or \
-                     (side == "SHORT" and price <= take_profit)
-            hit_sl = (side == "LONG" and price <= stop_loss) or \
-                     (side == "SHORT" and price >= stop_loss)
-            if hit_tp or hit_sl:
-                was_sl = hit_sl and not position["breakeven_done"]
-                pnl = close_pnl(position, price, exit_is_maker=hit_tp)
-                kind = "止盈" if hit_tp else ("止损" if was_sl else "保本出场")
-                log(f"平仓 [{kind}]：{side} 入场 {entry:.1f} 出场 {price:.1f}，"
-                    f"本单盈亏 {pnl:+.2f} U，今日累计 {risk.daily_pnl_usdt + pnl:+.2f} U。")
-                risk.record_trade_closed(pnl, was_sl=was_sl, now=now)
-                position = None
-                save_state()
-                time.sleep(60)
+        for symbol in SYMBOLS:
+            price = get_price_dry_run(symbol)
+            if price is None:
                 continue
-            # 持仓心跳：持仓时每 20 秒记一行，证明循环活着；止损/止盈/保本也查得更勤，
-            # 避免 1 分钟才查一次错过价格尖峰
-            float_pnl = (price - entry) * position["qty"] if side == "LONG" else (entry - price) * position["qty"]
-            log(f"持仓中：{side} @{entry:.1f}，现价 {price:.1f}，浮盈 {float_pnl:+.2f} U，"
-                f"止损 {stop_loss:.1f}，止盈 {take_profit:.1f}，"
-                f"保本{'已移' if position['breakeven_done'] else '未触发'}。")
-            time.sleep(20)
-            continue
+            position = positions[symbol]
 
-        # ---------- 无持仓：等 5 分钟 K 线收盘再判断 ----------
-        indicators = compute_indicators()
-        if indicators is None:
-            time.sleep(60)
-            continue
-        if indicators["candle_open_time"] == last_eval_candle:
-            # 这根 5 分钟 K 线已经判断过，等下一根
-            log(f"无信号，BTC 现价 {price:.1f}，继续等 1 分钟。")
-            time.sleep(60)
-            continue
-        last_eval_candle = indicators["candle_open_time"]
+            # ---------- 持仓管理（持仓时每 20 秒查一次止盈/止损/保本）----------
+            if position is not None:
+                any_holding = True
+                side = position["side"]
+                entry = position["entry"]
+                risk_distance = abs(entry - position["stop_loss"])
+                stop_loss = position["stop_loss"]
+                take_profit = position["take_profit"]
 
-        # 入场按判断时的实时价，不用滞后的 5 分钟 K 线收盘价（2026-11-10 的教训：
-        # 收盘价 72964.9 开单时实时价已到约 73290，差了 325 点）
-        signal = evaluate(price=price, atr=indicators["atr"],
-                          ema200_1h=indicators["ema200_1h"], adx15=indicators["adx15"],
-                          ma_fast=indicators["ma_fast"], ma_slow=indicators["ma_slow"],
-                          midline=indicators["midline"],
-                          volume=indicators["volume"], volume_sma=indicators["volume_sma"],
-                          log=log)
-        if signal is None:
-            log(f"无信号，BTC 现价 {price:.1f}（5m 收 {indicators['price']:.1f}），继续等。")
-            time.sleep(60)
-            continue
+                # 保本：赚到 1 倍风险就把止损移到成本价
+                if not position["breakeven_done"]:
+                    if side == "LONG" and price >= entry + risk_distance:
+                        position["stop_loss"] = entry
+                        position["breakeven_done"] = True
+                        stop_loss = entry
+                        log(f"保本触发：{symbol} {side} 已赚 1 倍风险，止损移到成本价 {entry:.1f}。")
+                        save_state()  # 保本后的止损要落盘，重启也不丢
+                    elif side == "SHORT" and price <= entry - risk_distance:
+                        position["stop_loss"] = entry
+                        position["breakeven_done"] = True
+                        stop_loss = entry
+                        log(f"保本触发：{symbol} {side} 已赚 1 倍风险，止损移到成本价 {entry:.1f}。")
+                        save_state()  # 保本后的止损要落盘，重启也不丢
 
-        log(f"信号触发: {signal['side']} @ {signal['entry']:.1f} 原因: {signal['reason']}")
-        ok, reason = risk.can_trade(now=now)
-        if not ok:
-            log(f"风控拦截：{reason}")
-            time.sleep(60)
-            continue
+                hit_tp = (side == "LONG" and price >= take_profit) or \
+                         (side == "SHORT" and price <= take_profit)
+                hit_sl = (side == "LONG" and price <= stop_loss) or \
+                         (side == "SHORT" and price >= stop_loss)
+                if hit_tp or hit_sl:
+                    was_sl = hit_sl and not position["breakeven_done"]
+                    pnl = close_pnl(position, price, exit_is_maker=hit_tp)
+                    kind = "止盈" if hit_tp else ("止损" if was_sl else "保本出场")
+                    log(f"平仓 [{kind}]：{symbol} {side} 入场 {entry:.1f} 出场 {price:.1f}，"
+                        f"本单盈亏 {pnl:+.2f} U，今日累计 {risk.daily_pnl_usdt + pnl:+.2f} U。")
+                    risk.record_trade_closed(symbol, pnl, was_sl=was_sl, now=now)
+                    positions[symbol] = None
+                    save_state()
+                    continue
+                # 持仓心跳：持仓时每 20 秒记一行，证明循环活着；止损/止盈/保本也查得更勤，
+                # 避免 1 分钟才查一次错过价格尖峰
+                float_pnl = (price - entry) * position["qty"] if side == "LONG" else (entry - price) * position["qty"]
+                log(f"持仓中：{symbol} {side} @{entry:.1f}，现价 {price:.1f}，浮盈 {float_pnl:+.2f} U，"
+                    f"止损 {stop_loss:.1f}，止盈 {take_profit:.1f}，"
+                    f"保本{'已移' if position['breakeven_done'] else '未触发'}。")
+                continue
 
-        qty, margin_usdt, max_loss = risk.size_position(
-            entry=signal["entry"], stop_loss=signal["stop_loss"]
-        )
-        if qty <= 0:
-            log(f"风控拦截：按止损距离算，亏损会超 40 U 上限（算出 {max_loss:.2f} U），放弃这单。")
-            time.sleep(60)
-            continue
-        signal["max_loss_usdt"] = max_loss
+            # ---------- 无持仓：等 5 分钟 K 线收盘再判断 ----------
+            indicators = compute_indicators(symbol)
+            if indicators is None:
+                continue
+            if indicators["candle_open_time"] == last_eval_candle[symbol]:
+                # 这根 5 分钟 K 线已经判断过，等下一根
+                log(f"无信号，{symbol} 现价 {price:.1f}，继续等 1 分钟。")
+                continue
+            last_eval_candle[symbol] = indicators["candle_open_time"]
 
-        # 下单前校验：没止损止盈、方向不对、亏损超上限，一律拒绝
-        try:
-            risk.validate_order(signal)
-        except ValueError as e:
-            log(f"风控拦截：{e}")
-            time.sleep(60)
-            continue
+            # 入场按判断时的实时价，不用滞后的 5 分钟 K 线收盘价（2026-11-10 的教训：
+            # 收盘价 72964.9 开单时实时价已到约 73290，差了 325 点）
+            signal = evaluate(price=price, atr=indicators["atr"],
+                              ema200_1h=indicators["ema200_1h"], adx15=indicators["adx15"],
+                              ma_fast=indicators["ma_fast"], ma_slow=indicators["ma_slow"],
+                              midline=indicators["midline"],
+                              volume=indicators["volume"], volume_sma=indicators["volume_sma"],
+                              log=log)
+            if signal is None:
+                log(f"无信号，{symbol} 现价 {price:.1f}（5m 收 {indicators['price']:.1f}），继续等。")
+                continue
 
-        if DRY_RUN:
-            place_order_dry_run(signal, qty, margin_usdt)
-        else:
-            place_order_live(signal, qty, margin_usdt)
-        risk.record_trade_opened(now=now)
-        position = {
-            "side": signal["side"],
-            "entry": signal["entry"],
-            "qty": qty,
-            "margin": margin_usdt,
-            "stop_loss": signal["stop_loss"],
-            "take_profit": signal["take_profit_1"],
-            "breakeven_done": False,
-            "opened_at": now,
-            "atr": signal.get("atr"),
-        }
-        save_state()
-        time.sleep(60)
+            signal["symbol"] = symbol
+            log(f"信号触发: {symbol} {signal['side']} @ {signal['entry']:.1f} 原因: {signal['reason']}")
+
+            # 全账户同时持仓上限（每个币种最多 1 单）
+            open_count = sum(1 for p in positions.values() if p is not None)
+            if open_count >= MAX_OPEN_POSITIONS * len(SYMBOLS):
+                log(f"风控拦截：同时持仓已满 {open_count} 单，不开 {symbol}。")
+                continue
+
+            ok, reason = risk.can_trade(symbol, now=now)
+            if not ok:
+                log(f"风控拦截：{reason}")
+                continue
+
+            qty, margin_usdt, max_loss = risk.size_position(
+                entry=signal["entry"], stop_loss=signal["stop_loss"]
+            )
+            if qty <= 0:
+                log(f"风控拦截：按止损距离算，亏损会超 40 U 上限（算出 {max_loss:.2f} U），放弃这单。")
+                continue
+            signal["max_loss_usdt"] = max_loss
+
+            # 下单前校验：没止损止盈、方向不对、亏损超上限，一律拒绝
+            try:
+                risk.validate_order(signal)
+            except ValueError as e:
+                log(f"风控拦截：{e}")
+                continue
+
+            if DRY_RUN:
+                place_order_dry_run(signal, qty, margin_usdt)
+            else:
+                place_order_live(signal, qty, margin_usdt)
+            risk.record_trade_opened(symbol, now=now)
+            positions[symbol] = {
+                "side": signal["side"],
+                "entry": signal["entry"],
+                "qty": qty,
+                "margin": margin_usdt,
+                "stop_loss": signal["stop_loss"],
+                "take_profit": signal["take_profit_1"],
+                "breakeven_done": False,
+                "opened_at": now,
+                "atr": signal.get("atr"),
+            }
+            save_state()
+
+        # 有持仓时 20 秒一轮（止损查得勤），没持仓时 60 秒一轮
+        time.sleep(20 if any_holding else 60)
 
 
 if __name__ == "__main__":
