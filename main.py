@@ -162,7 +162,6 @@ def compute_indicators(symbol: str) -> dict | None:
         "adx15": adx_value,
         "range_top": range_top,
         "range_bottom": range_bottom,
-        "midline": (range_top + range_bottom) / 2,
     }
 
 

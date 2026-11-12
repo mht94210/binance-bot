@@ -172,7 +172,7 @@ class RiskManager:
     # ---------- 仓位计算 ----------
     def size_position(self, entry: float, stop_loss: float) -> tuple[float, float, float]:
         """
-        按风险倒推仓位：名义仓位 = 每单风险额 / 止损距离%，保证金封顶 200 U。
+        按风险倒推仓位：名义仓位 = 每单风险额 / 止损距离%，保证金按 MAX_MARGIN_PER_TRADE_USDT 封顶。
         每单风险额 = 本金 x 0.5%（10 U）。返回 (数量, 保证金 USDT, 预期最大亏损 USDT)。
         预期最大亏损按 Taker 手续费保守估算；超 40 U 硬上限返回数量 0，放弃这单。
         """
@@ -185,7 +185,7 @@ class RiskManager:
         notional = risk_amount / stop_pct if stop_pct > 0 else 0.0
         margin = notional / LEVERAGE
 
-        # 保证金超 200 U：按 200 U 封顶倒推数量
+        # 保证金超上限：按 MAX_MARGIN_PER_TRADE_USDT 封顶倒推数量
         if margin > MAX_MARGIN_PER_TRADE_USDT:
             margin = MAX_MARGIN_PER_TRADE_USDT
             notional = margin * LEVERAGE
