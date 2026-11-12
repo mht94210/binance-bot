@@ -13,7 +13,7 @@ Binance BTC+ETH 永续合约短线机器人 —— 10 倍快进快出方案（�
   本仓库不含任何真实 Key、Secret、账号、密码。
 
 策略（写死在 config.py）：
-- 10 倍杠杆，一单最多 200 U 保证金，名义仓位 2000 U
+- 10 倍杠杆，一单最多 400 U 保证金，名义仓位 4000 U
 - 信号：15 分钟 K 线收盘时判断（4 小时 EMA200 + 1 小时 EMA200 同向定方向 + 15 分钟 ADX>30 + 15 分钟均线，3/3 全票）
 - 止损 2 倍 ATR，止盈 3 倍 ATR，盈亏比 1:1.5；止盈目标 < 0.30% 不做
 - 赚到 1 倍风险就把止损移到成本价（保本）；进场限价单，止损市价单
@@ -288,7 +288,7 @@ def main() -> None:
                 f"{MAX_DAILY_LOSS_USDT:.0f} U 收紧到 {CONSERVATIVE_DAILY_LOSS_USDT:.0f} U，"
                 f"免得今天实际亏超 {MAX_DAILY_LOSS_USDT:.0f} U；UTC 午夜自动恢复。")
 
-    # 启动预热：跳过当前这根 5 分钟 K 线，等下一根收盘再判断，
+    # 启动预热：跳过当前这根 15 分钟 K 线，等下一根收盘再判断，
     # 避免重启后几秒钟就按一根快收完的 K 线立即开单。
     _warmed = False
     for symbol in SYMBOLS:
@@ -300,7 +300,7 @@ def main() -> None:
         except Exception:  # noqa: BLE001
             pass
     if _warmed:
-        log("启动预热：已跳过当前 5 分钟 K 线，等下一根收盘再判断。")
+        log("启动预热：已跳过当前 15 分钟 K 线，等下一根收盘再判断。")
 
     while True:
         if stop_file.exists():
@@ -378,7 +378,7 @@ def main() -> None:
                         f"保本{'已移' if position['breakeven_done'] else '未触发'}。")
                 continue
 
-            # ---------- 无持仓：等 5 分钟 K 线收盘再判断 ----------
+            # ---------- 无持仓：等 15 分钟 K 线收盘再判断 ----------
             # 持仓时主循环 5 秒一轮，空仓币种不能每 5 秒拉 3 组 K 线：60 秒最多判断一次。
             if now - last_flat_eval[symbol] < 55:
                 continue
@@ -387,7 +387,7 @@ def main() -> None:
             if indicators is None:
                 continue
             if indicators["candle_open_time"] == last_eval_candle[symbol]:
-                # 这根 5 分钟 K 线已经判断过，等下一根
+                # 这根 15 分钟 K 线已经判断过，等下一根
                 log(f"无信号，{symbol} 现价 {price:.1f}，继续等 1 分钟。")
                 continue
             last_eval_candle[symbol] = indicators["candle_open_time"]
