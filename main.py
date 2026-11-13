@@ -16,7 +16,9 @@ Binance BTC+ETH 永续合约短线机器人 —— 10 倍快进快出方案（�
 - 10 倍杠杆，一单最多 200 U 保证金，名义仓位 2000 U
 - 信号：15 分钟 K 线收盘时判断；区间 = 最近 24 根 15 分钟 K 线（6 小时）最高/最低；
   只做震荡：15 分钟 ADX 必须 <25（有趋势不动）；现价在区间上沿 25% 区域内做空，
-  下沿 25% 区域内做多；区间中部不动；已突破上下沿不追；区间太窄（<0.6%）不动
+  下沿 25% 区域内做多；区间中部不动；已突破上下沿不追；区间太窄（<0.6%）不动；
+  趋势过滤（2026-11-13 用户确认）：只顺 1 小时趋势做，做多要现价在 1 小时 EMA200 之上、
+  做空要在 1 小时 EMA200 之下，逆趋势不做
 - 止损：区间沿外 0.5 倍 ATR；止盈：对侧沿（整段区间），盈亏比约 1:2 到 1:4；
   止盈目标 < 0.30% 不做
 - 赚到 1 倍风险就把止损移到成本价（保本）；进场限价单，止损市价单
@@ -53,9 +55,12 @@ from config import (
     RANGE_LOOKBACK,
     SYMBOLS,
     TAKER_FEE_PCT,
+    TREND_EMA_PERIOD,
+    TREND_INTERVAL,
+    TREND_KLINES_LIMIT,
     load_api_credentials,
 )
-from indicators import adx, atr
+from indicators import adx, atr, ema
 from risk import RiskManager
 from strategy import evaluate
 
@@ -141,9 +146,10 @@ def get_klines(symbol: str, interval: str, limit: int) -> list[dict]:
 
 
 def compute_indicators(symbol: str) -> dict | None:
-    """只拉 15 分钟 K 线，算出震荡信号要用的指标。失败返回 None。
+    """拉 15 分钟 K 线算震荡信号要用的指标，再拉 1 小时 K 线算趋势过滤的 EMA200。
     只用已收盘的 K 线（去掉最后一根未收盘的）。
-    区间 = 最近 24 根 15 分钟 K 线（6 小时）的最高价 / 最低价。"""
+    区间 = 最近 24 根 15 分钟 K 线（6 小时）的最高价 / 最低价。
+    1 小时 K 线不够 200 根时 EMA200 为 None，策略会按预热挡住不开单。"""
     k15 = get_klines(symbol, "15m", 40)
     if len(k15) < ATR_PERIOD + 2 or len(k15) < ADX_PERIOD * 2 + 1 or len(k15) < RANGE_LOOKBACK + 1:
         log(f"{symbol} K 线不够，指标算不出来，等下一根 15 分钟 K 线。")
@@ -155,6 +161,10 @@ def compute_indicators(symbol: str) -> dict | None:
     recent = closed15[-RANGE_LOOKBACK:]
     range_top = max(k["high"] for k in recent)
     range_bottom = min(k["low"] for k in recent)
+    # 趋势过滤：1 小时 EMA200（2026-11-13 用户确认，10 单观察后加）
+    k1h = get_klines(symbol, TREND_INTERVAL, TREND_KLINES_LIMIT)
+    closed1h = k1h[:-1] if len(k1h) > 1 else []
+    ema200_1h = ema([k["close"] for k in closed1h], TREND_EMA_PERIOD)
     return {
         "candle_open_time": closed15[-1]["open_time"],
         "price": closed15[-1]["close"],
@@ -162,6 +172,7 @@ def compute_indicators(symbol: str) -> dict | None:
         "adx15": adx_value,
         "range_top": range_top,
         "range_bottom": range_bottom,
+        "ema200_1h": ema200_1h,
     }
 
 
@@ -222,6 +233,7 @@ def main() -> None:
     log("BTC+ETH 合约震荡机器人启动（震荡版：高空低多，2026-11-11 用户确认；和德国趋势版互补）")
     log(f"标的: {', '.join(SYMBOLS)} | Dry-Run: {DRY_RUN} | 实盘开关: {LIVE_TRADING_ENABLED}")
     log("策略: 15m 震荡高空低多（最近 6 小时区间上下沿，ADX<25 才做，现价到上沿 25% 做空、下沿 25% 做多）；"
+        "趋势过滤（2026-11-13 用户确认）：只顺 1 小时趋势做，做多要现价在 1 小时 EMA200 之上、做空要在之下；"
         "止损沿外 0.5 倍 ATR，止盈对侧沿，盈亏比约 1:2 到 1:4；赚 1 倍风险保本；"
         "进场限价单，止损市价单；冷却 15 分钟（止损后 30 分钟）；"
         "每个币种一天最多 10 单、同时最多 1 单（全账户同时最多 2 单）；"
@@ -397,6 +409,7 @@ def main() -> None:
                               adx15=indicators["adx15"],
                               range_top=indicators["range_top"],
                               range_bottom=indicators["range_bottom"],
+                              ema200_1h=indicators.get("ema200_1h"),
                               log=log)
             if signal is None:
                 log(f"无信号，{symbol} 现价 {price:.1f}（区间 {indicators['range_bottom']:.1f}-{indicators['range_top']:.1f}），继续等。")

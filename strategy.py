@@ -4,12 +4,14 @@
 版本：2026-11-11 用户确认：日本机器人改成震荡版，和德国趋势版（少而精，ADX>30）互补。
 - 信号周期：15 分钟 K 线收盘时判断；持仓管理每 5 秒轮询（止盈止损 / 保本）。
 - 区间：最近 24 根 15 分钟 K 线（6 小时）的最高价 / 最低价。
-- 四道闸门：
+- 五道闸门：
   1. 只做震荡：15 分钟 ADX 必须 <25（高于 25 说明有趋势，震荡策略不动，趋势交给德国版）；
   2. 区间不能太窄：宽度 <0.6% 不做（死水里噪音会反复打止损）；
   3. 位置：现价在区间上沿 25% 区域内做空，下沿 25% 区域内做多，中间 50% 不动；
      已突破上沿/下沿（疑似趋势启动）不追；
-  4. 手续费地板：止盈目标 < 0.30% 不做。
+  4. 趋势过滤（2026-11-13 用户确认，10 单观察 0 胜 10 负后加）：只顺 1 小时趋势做，
+     做多要现价在 1 小时 EMA200 之上，做空要现价在 1 小时 EMA200 之下，逆趋势不做；
+  5. 手续费地板：止盈目标 < 0.30% 不做。
 - 止损止盈：止损放在区间沿外 0.5 倍 ATR；止盈看对侧沿（整段区间），盈亏比约 1:2 到 1:4。
 - 冷却与额度由风控器管（震荡信号没有“票数”，不跳过冷却）。
 - 保本和出场由 main.py 管：赚到 1 倍风险就把止损移到成本价。
@@ -27,6 +29,7 @@ from config import (
 
 def evaluate(price: float, atr: float | None, adx15: float | None,
              range_top: float | None, range_bottom: float | None,
+             ema200_1h: float | None = None,
              log=None) -> dict | None:
     """
     在一根 15 分钟 K 线收盘时调用。price 是判断时的实时价（不是那根 K 线的收盘价，
@@ -44,6 +47,8 @@ def evaluate(price: float, atr: float | None, adx15: float | None,
         return _blocked("ATR 还没算出来（15 分钟 K 线不够 15 根），等预热。")
     if adx15 is None:
         return _blocked("15 分钟 ADX 还没算出来，等预热。")
+    if ema200_1h is None:
+        return _blocked("1 小时 EMA200 还没算出来（1 小时 K 线不够 200 根），等预热。")
     if range_top is None or range_bottom is None or range_top <= range_bottom:
         return _blocked("区间还没算出来（15 分钟 K 线不够 24 根），等预热。")
     if adx15 >= ADX_MAX:
@@ -66,6 +71,9 @@ def evaluate(price: float, atr: float | None, adx15: float | None,
 
     if price >= upper_line:
         # 上沿区做空：止损在上沿外 0.5 倍 ATR，止盈看下沿（整段区间）
+        # 趋势过滤：现价必须在 1 小时 EMA200 之下（大方向向下才做空），在之上不逆趋势做空
+        if price >= ema200_1h:
+            return _blocked(f"大方向向上：现价 {price:.1f} 在 1 小时 EMA200 {ema200_1h:.1f} 之上，不逆趋势做空。")
         stop_loss = range_top + edge_sl
         take_profit = range_bottom
         tp_pct = (price - take_profit) / price
@@ -81,11 +89,14 @@ def evaluate(price: float, atr: float | None, adx15: float | None,
             "atr": atr,
             "votes": 0,
             "reason": f"震荡做空（区间 {range_bottom:.1f}-{range_top:.1f}，现价在上沿区/ADX {adx15:.0f}），"
-                      f"止损 {stop_loss:.1f}，止盈 {take_profit:.1f}",
+                      f"止损 {stop_loss:.1f}，止盈 {take_profit:.1f}，1h EMA200 {ema200_1h:.1f} 之下顺势",
             "mode": "range",
         }
     if price <= lower_line:
         # 下沿区做多：止损在下沿外 0.5 倍 ATR，止盈看上沿（整段区间）
+        # 趋势过滤：现价必须在 1 小时 EMA200 之上（大方向向上才做多），在之下不逆趋势做多
+        if price <= ema200_1h:
+            return _blocked(f"大方向向下：现价 {price:.1f} 在 1 小时 EMA200 {ema200_1h:.1f} 之下，不逆趋势做多。")
         stop_loss = range_bottom - edge_sl
         take_profit = range_top
         tp_pct = (take_profit - price) / price
@@ -101,7 +112,7 @@ def evaluate(price: float, atr: float | None, adx15: float | None,
             "atr": atr,
             "votes": 0,
             "reason": f"震荡做多（区间 {range_bottom:.1f}-{range_top:.1f}，现价在下沿区/ADX {adx15:.0f}），"
-                      f"止损 {stop_loss:.1f}，止盈 {take_profit:.1f}",
+                      f"止损 {stop_loss:.1f}，止盈 {take_profit:.1f}，1h EMA200 {ema200_1h:.1f} 之上顺势",
             "mode": "range",
         }
     return _blocked(f"价格在区间中部（{range_bottom:.1f}-{range_top:.1f}，现价 {price:.1f}），不在上下沿，不做。")
