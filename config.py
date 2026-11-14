@@ -95,6 +95,7 @@ NEWS_PAUSE_WINDOWS: list[tuple[str, str]] = [
 # ---------- 实盘入场等待（有界等待：超时未成交就撤单，绝不等死）----------
 ENTRY_FILL_TIMEOUT_SECONDS = 60  # Post Only 入场单最多等 60 秒
 ENTRY_POLL_SECONDS = 2           # 等成交时每 2 秒查一次订单状态
+RECV_WINDOW_MS = 60000           # 币安签名请求容忍时间（毫秒），上限 60000；2026-11-14 实盘 -1021：Cloady 容器时钟与币安差 >5 秒，默认 5000 毫秒不够
 
 # ---------- 运行模式 ----------
 # 默认 Dry-Run：只看行情、只记“本来会下的单”，绝不下真实单。

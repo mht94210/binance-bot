@@ -59,6 +59,7 @@ from config import (
     MAKER_FEE_PCT,
     MAX_DAILY_LOSS_USDT,
     MAX_OPEN_POSITIONS,
+    RECV_WINDOW_MS,
     SYMBOLS,
     TAKER_FEE_PCT,
     VOL_SMA_PERIOD,
@@ -286,12 +287,12 @@ class LiveTrader:
         但精度拿不到必须抛错。"""
         for symbol in SYMBOLS:
             try:
-                res = self.client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
+                res = self.client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE, recvWindow=RECV_WINDOW_MS)
                 self.log(f"实盘准备：{symbol} 杠杆设为 {res.get('leverage', LEVERAGE)}x。")
             except Exception as e:  # noqa: BLE001 - 杠杆可能已是 10x，记一笔继续
                 self.log(f"实盘准备警告：{symbol} 改杠杆失败（{e}），请确认该币种已是 {LEVERAGE}x，否则不要实盘。")
             try:
-                self.client.futures_change_margin_type(symbol=symbol, marginType="ISOLATED")
+                self.client.futures_change_margin_type(symbol=symbol, marginType="ISOLATED", recvWindow=RECV_WINDOW_MS)
             except Exception as e:  # noqa: BLE001 - 已是逐仓时会报错，记一笔继续
                 self.log(f"实盘准备：{symbol} 改逐仓未成功（{e}），可能已是逐仓。")
         self.load_filters()
@@ -313,7 +314,7 @@ class LiveTrader:
         try:
             order = self.client.futures_create_order(
                 symbol=symbol, side=order_side, type="LIMIT",
-                quantity=qty_r, price=price, timeInForce="GTX")
+                quantity=qty_r, price=price, timeInForce="GTX", recvWindow=RECV_WINDOW_MS)
         except Exception as e:  # noqa: BLE001 - 区分“会立即成交被拒”和其它异常
             msg = str(e)
             code = getattr(e, "code", None)
@@ -325,7 +326,7 @@ class LiveTrader:
         while time.time() < deadline:
             sleep_fn(ENTRY_POLL_SECONDS)
             try:
-                cur = self.client.futures_get_order(symbol=symbol, orderId=order_id)
+                cur = self.client.futures_get_order(symbol=symbol, orderId=order_id, recvWindow=RECV_WINDOW_MS)
             except Exception as e:  # noqa: BLE001 - 查单失败不致命，下轮再查
                 self.log(f"查入场单 {order_id} 失败：{e}，继续等。")
                 continue
@@ -338,13 +339,13 @@ class LiveTrader:
                 raise LiveOrderRejected(f"入场单状态 {status}，没成交。")
         # 超时：查最后状态，撤掉没成交的部分
         try:
-            cur = self.client.futures_get_order(symbol=symbol, orderId=order_id)
+            cur = self.client.futures_get_order(symbol=symbol, orderId=order_id, recvWindow=RECV_WINDOW_MS)
         except Exception as e:  # noqa: BLE001
             self.log(f"超时后查入场单 {order_id} 失败：{e}，按未成交处理。")
             cur = {}
         filled = float(cur.get("executedQty") or 0)
         try:
-            self.client.futures_cancel_order(symbol=symbol, orderId=order_id)
+            self.client.futures_cancel_order(symbol=symbol, orderId=order_id, recvWindow=RECV_WINDOW_MS)
         except Exception as e:  # noqa: BLE001 - 可能已全部成交，撤单报错正常
             self.log(f"超时撤单 {order_id} 失败（可能已成交）：{e}")
         if filled <= 0:
@@ -359,7 +360,7 @@ class LiveTrader:
         exit_side = "SELL" if side == "LONG" else "BUY"
         order = self.client.futures_create_order(
             symbol=symbol, side=exit_side, type="STOP_MARKET",
-            stopPrice=self.round_price(symbol, stop_price), closePosition="true")
+            stopPrice=self.round_price(symbol, stop_price), closePosition="true", recvWindow=RECV_WINDOW_MS)
         return order["orderId"]
 
     def place_take_profit(self, symbol: str, side: str, qty: float, tp_price: float) -> int:
@@ -369,7 +370,7 @@ class LiveTrader:
             symbol=symbol, side=exit_side, type="LIMIT",
             quantity=self.round_qty(symbol, qty),
             price=self.round_price(symbol, tp_price),
-            timeInForce="GTC", reduceOnly="true")
+            timeInForce="GTC", reduceOnly="true", recvWindow=RECV_WINDOW_MS)
         return order["orderId"]
 
     def place_protection(self, symbol: str, side: str, qty: float,
@@ -384,7 +385,7 @@ class LiveTrader:
             tp_id = self.place_take_profit(symbol, side, qty, take_profit)
         except Exception as e:  # noqa: BLE001
             try:
-                self.client.futures_cancel_order(symbol=symbol, orderId=sl_id)
+                self.client.futures_cancel_order(symbol=symbol, orderId=sl_id, recvWindow=RECV_WINDOW_MS)
             except Exception:  # noqa: BLE001 - 撤不掉也继续，调用方会市价平仓
                 pass
             raise LiveOrderError(f"挂止盈失败：{e}")
@@ -395,7 +396,7 @@ class LiveTrader:
         exit_side = "SELL" if side == "LONG" else "BUY"
         return self.client.futures_create_order(
             symbol=symbol, side=exit_side, type="MARKET",
-            quantity=self.round_qty(symbol, qty), reduceOnly="true")
+            quantity=self.round_qty(symbol, qty), reduceOnly="true", recvWindow=RECV_WINDOW_MS)
 
     # ---------- 持仓查询 ----------
     def poll_exit_orders(self, symbol: str, position: dict) -> dict:
@@ -407,7 +408,7 @@ class LiveTrader:
             if not oid:
                 continue
             try:
-                order = self.client.futures_get_order(symbol=symbol, orderId=oid)
+                order = self.client.futures_get_order(symbol=symbol, orderId=oid, recvWindow=RECV_WINDOW_MS)
             except Exception as e:  # noqa: BLE001 - 查单失败不等于没成交，下轮再查
                 self.log(f"查订单 {oid} 失败：{e}，下轮再查。")
                 continue
@@ -419,7 +420,7 @@ class LiveTrader:
                 other = position.get("sl_order_id") if kind == "TP" else position.get("tp_order_id")
                 if other:
                     try:
-                        self.client.futures_cancel_order(symbol=symbol, orderId=other)
+                        self.client.futures_cancel_order(symbol=symbol, orderId=other, recvWindow=RECV_WINDOW_MS)
                     except Exception:  # noqa: BLE001 - 对方可能已撤/已成交，忽略
                         pass
                 break
@@ -427,7 +428,7 @@ class LiveTrader:
 
     def get_position_state(self, symbol: str) -> dict:
         """交易所持仓快照：{"amt", "entry", "mark", "leverage"}。"""
-        infos = self.client.futures_position_information(symbol=symbol)
+        infos = self.client.futures_position_information(symbol=symbol, recvWindow=RECV_WINDOW_MS)
         for info in infos or []:
             if info.get("symbol") == symbol:
                 return {"amt": float(info.get("positionAmt") or 0),
@@ -437,10 +438,10 @@ class LiveTrader:
         return {"amt": 0.0, "entry": 0.0, "mark": 0.0, "leverage": 0}
 
     def get_open_orders(self, symbol: str) -> list:
-        return list(self.client.futures_get_open_orders(symbol=symbol) or [])
+        return list(self.client.futures_get_open_orders(symbol=symbol, recvWindow=RECV_WINDOW_MS) or [])
 
     def get_all_orders(self, symbol: str, limit: int = 20) -> list:
-        return list(self.client.futures_get_all_orders(symbol=symbol, limit=limit) or [])
+        return list(self.client.futures_get_all_orders(symbol=symbol, limit=limit, recvWindow=RECV_WINDOW_MS) or [])
 
     def move_stop_to_breakeven(self, symbol: str, position: dict,
                                sleep_fn=time.sleep) -> bool:
@@ -450,7 +451,7 @@ class LiveTrader:
         old_sl = position.get("sl_order_id")
         if old_sl:
             try:
-                self.client.futures_cancel_order(symbol=symbol, orderId=old_sl)
+                self.client.futures_cancel_order(symbol=symbol, orderId=old_sl, recvWindow=RECV_WINDOW_MS)
             except Exception as e:  # noqa: BLE001 - 旧止损可能已成交，调用方下轮会发现平仓
                 self.log(f"保本撤旧止损 {old_sl} 失败：{e}，本次不移动。")
                 return False
@@ -473,7 +474,7 @@ class LiveTrader:
         wanted = {oid for oid in order_ids if oid}
         for attempt in range(3):
             try:
-                trades = self.client.futures_account_trades(symbol=symbol, startTime=start_time_ms)
+                trades = self.client.futures_account_trades(symbol=symbol, startTime=start_time_ms, recvWindow=RECV_WINDOW_MS)
                 break
             except Exception as e:  # noqa: BLE001
                 if attempt == 2:
