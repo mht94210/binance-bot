@@ -221,7 +221,17 @@ class LiveTrader:
     约定（币安 USD-M 永续）：
     - 入场：LIMIT + timeInForce=GTX（Post Only，只吃 maker 费）。
     - 止损：STOP_MARKET + closePosition="true"（整仓平掉，不怕部分成交后数量对不上）。
-    - 止盈：LIMIT + reduceOnly="true"，数量 = 实际成交量。
+      注意：新版 python-binance（>=1.0.33，部署时装最新版）把 STOP_MARKET
+      这类条件单自动路由到币安 algoOrder 端点，返回里只有 algoId、没有
+      orderId（2026-11-15 实盘事故：place_stop 取 order["orderId"] 抛
+      KeyError，机器人误判挂单失败）。止损单的查询/撤单必须走 algo 接口
+     （futures_get_algo_order / futures_cancel_algo_order），普通
+      futures_get_order / futures_cancel_order 查不到它。
+    - 止盈：LIMIT，数量 = 实际成交量；reduceOnly 只在单向持仓模式下带。
+      双向持仓模式下币安不接受 reduceOnly（-1106），只靠 positionSide
+      限定方向（2026-11-15 实盘事故：市价平仓带 reduceOnly 被 -1106 拒单）。
+    - 市价平仓（兜底）：MARKET；reduceOnly 同样只在单向模式下带，-1106 时
+      去掉 reduceOnly 重试一次，绝不留裸仓。
     - 布尔参数必须传字符串 "true"/"false"（python-binance 文档要求），不能传 Python 布尔值。
     - 订单状态以交易所返回为准；任何一步失败都抛异常或返回 False，绝不靠猜。
     """
@@ -416,25 +426,65 @@ class LiveTrader:
         self.log(f"入场部分成交：成交 {filled}/{qty_r}，按实际成交量建仓。")
         return {"order_id": order_id, "qty": filled, "avg_price": avg}
 
+    @staticmethod
+    def _order_id_from_response(order) -> int | None:
+        """从下单返回里取订单 id：新版库的条件单（algo 单）返回 algoId，
+        旧版库 / 普通单返回 orderId；两个都没有返回 None（调用方记原始返回再报错）。"""
+        if not isinstance(order, dict):
+            return None
+        for key in ("algoId", "orderId"):
+            val = order.get(key)
+            if val:
+                try:
+                    return int(val)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
     def place_stop(self, symbol: str, side: str, stop_price: float) -> int:
-        """挂止损市价单（closePosition，全仓平掉）。返回订单 id。"""
+        """挂止损市价单（closePosition，全仓平掉）。返回订单 id。
+        新版 python-binance 把 STOP_MARKET 路由到 algoOrder 端点，返回的是
+        algoId（没有 orderId）；旧版返回 orderId。两种都认。返回里两个都
+        没有：记下原始返回再抛明确错误，绝不能让 KeyError 淹没下单状态
+        （2026-11-15 事故：止损其实已在交易所挂上，机器人却以为失败）。"""
         exit_side = "SELL" if side == "LONG" else "BUY"
         order = self.client.futures_create_order(
             symbol=symbol, side=exit_side, type="STOP_MARKET",
             stopPrice=self.round_price(symbol, stop_price), closePosition="true",
             positionSide=self._pos_side(side), recvWindow=RECV_WINDOW_MS)
-        return order["orderId"]
+        oid = self._order_id_from_response(order)
+        if oid is None:
+            self.log(f"挂止损返回异常（无 orderId/algoId），原始返回：{order!r}")
+            raise LiveOrderError(f"挂止损返回里没有订单 id，原始返回：{order!r}")
+        return oid
 
     def place_take_profit(self, symbol: str, side: str, qty: float, tp_price: float) -> int:
-        """挂止盈限价单（reduceOnly）。返回订单 id。"""
+        """挂止盈限价单。返回订单 id。
+        reduceOnly 只在单向持仓模式下带：双向持仓模式下币安不接受 reduceOnly
+        （-1106），只靠 positionSide 限定方向。万一持仓模式识别错了导致
+        -1106，去掉 reduceOnly 重试一次（-1106 是参数校验拒单，没下成单，重试安全）。"""
         exit_side = "SELL" if side == "LONG" else "BUY"
-        order = self.client.futures_create_order(
-            symbol=symbol, side=exit_side, type="LIMIT",
-            quantity=self.round_qty(symbol, qty),
-            price=self.round_price(symbol, tp_price),
-            timeInForce="GTC", reduceOnly="true",
-            positionSide=self._pos_side(side), recvWindow=RECV_WINDOW_MS)
-        return order["orderId"]
+        params = dict(symbol=symbol, side=exit_side, type="LIMIT",
+                      quantity=self.round_qty(symbol, qty),
+                      price=self.round_price(symbol, tp_price),
+                      timeInForce="GTC",
+                      positionSide=self._pos_side(side), recvWindow=RECV_WINDOW_MS)
+        if not self.hedge_mode:
+            params["reduceOnly"] = "true"
+        try:
+            order = self.client.futures_create_order(**params)
+        except Exception as e:  # noqa: BLE001 - 只处理 -1106 重试，其它原样抛出
+            if getattr(e, "code", None) == -1106 and "reduceOnly" in params:
+                self.log("挂止盈被 -1106 拒（reduceOnly 不可用），去掉 reduceOnly 重试一次。")
+                params.pop("reduceOnly")
+                order = self.client.futures_create_order(**params)
+            else:
+                raise
+        oid = self._order_id_from_response(order)
+        if oid is None:
+            self.log(f"挂止盈返回异常（无 orderId/algoId），原始返回：{order!r}")
+            raise LiveOrderError(f"挂止盈返回里没有订单 id，原始返回：{order!r}")
+        return oid
 
     def place_protection(self, symbol: str, side: str, qty: float,
                          stop_loss: float, take_profit: float) -> dict:
@@ -448,43 +498,120 @@ class LiveTrader:
             tp_id = self.place_take_profit(symbol, side, qty, take_profit)
         except Exception as e:  # noqa: BLE001
             try:
-                self.client.futures_cancel_order(symbol=symbol, orderId=sl_id, recvWindow=RECV_WINDOW_MS)
+                self.cancel_algo_order(symbol, sl_id)
             except Exception:  # noqa: BLE001 - 撤不掉也继续，调用方会市价平仓
                 pass
             raise LiveOrderError(f"挂止盈失败：{e}")
         return {"sl_order_id": sl_id, "tp_order_id": tp_id}
 
     def market_close(self, symbol: str, side: str, qty: float) -> dict:
-        """市价单平掉指定数量（reduceOnly）。挂保护失败后的兜底，绝不留裸仓。"""
+        """市价单平掉指定数量。挂保护失败后的兜底，绝不留裸仓。
+        reduceOnly 只在单向持仓模式下带：双向持仓模式下币安不接受 reduceOnly
+        （-1106，2026-11-15 实盘事故就是这行导致兜底平仓失败、留下裸仓）。
+        -1106 时去掉 reduceOnly 重试一次（-1106 是参数校验拒单，没下成单，
+        重试安全；能兜住持仓模式识别错误的情况）。"""
         exit_side = "SELL" if side == "LONG" else "BUY"
-        return self.client.futures_create_order(
-            symbol=symbol, side=exit_side, type="MARKET",
-            quantity=self.round_qty(symbol, qty), reduceOnly="true",
-            positionSide=self._pos_side(side), recvWindow=RECV_WINDOW_MS)
+        params = dict(symbol=symbol, side=exit_side, type="MARKET",
+                      quantity=self.round_qty(symbol, qty),
+                      positionSide=self._pos_side(side), recvWindow=RECV_WINDOW_MS)
+        if not self.hedge_mode:
+            params["reduceOnly"] = "true"
+        try:
+            return self.client.futures_create_order(**params)
+        except Exception as e:  # noqa: BLE001 - 只处理 -1106 重试，其它原样抛出
+            if getattr(e, "code", None) == -1106 and "reduceOnly" in params:
+                self.log("市价平仓被 -1106 拒（reduceOnly 不可用），去掉 reduceOnly 重试一次。")
+                params.pop("reduceOnly")
+                return self.client.futures_create_order(**params)
+            raise
+
+    # ---------- 止损单是 algo 单：查询 / 撤单 / 挂单列表 ----------
+    def _query_stop_order(self, symbol: str, sl_id: int) -> dict:
+        """查止损单状态（归一化返回）：
+        {"triggered", "exit_price", "exit_order_id"}。
+        新版库：止损是 algo 单，用 futures_get_algo_order 查，algoStatus=
+        TRIGGERED（或已有实际成交价）才算触发成交，actualOrderId 是触发后
+        产生的真实市价单号（查手续费要用它），actualPrice 是成交均价。
+        查不到 algo 单（-2013，旧版库下的普通订单）：回落到普通查单。"""
+        get_algo = getattr(self.client, "futures_get_algo_order", None)
+        if get_algo is not None:
+            try:
+                res = get_algo(symbol=symbol, algoId=sl_id, recvWindow=RECV_WINDOW_MS)
+            except Exception as e:  # noqa: BLE001 - 只有 -2013 才回落，其它错误往上抛
+                if getattr(e, "code", None) != -2013:
+                    raise
+            else:
+                status = str(res.get("algoStatus") or "").upper()
+                actual_id = res.get("actualOrderId")
+                actual_price = float(res.get("actualPrice") or 0) or None
+                return {"triggered": status == "TRIGGERED"
+                        or (bool(actual_id) and actual_price is not None),
+                        "exit_price": actual_price,
+                        "exit_order_id": int(actual_id) if actual_id else None}
+        order = self.client.futures_get_order(symbol=symbol, orderId=sl_id, recvWindow=RECV_WINDOW_MS)
+        return {"triggered": order.get("status") == "FILLED",
+                "exit_price": float(order.get("avgPrice") or 0) or None,
+                "exit_order_id": sl_id}
+
+    def cancel_algo_order(self, symbol: str, algo_id: int) -> None:
+        """撤一个 algo 单（止损单）。新版库走 futures_cancel_algo_order；
+        目标不是 algo 单（-2013，旧版库下的普通订单）：回落到普通撤单。"""
+        cancel_algo = getattr(self.client, "futures_cancel_algo_order", None)
+        if cancel_algo is not None:
+            try:
+                cancel_algo(symbol=symbol, algoId=algo_id, recvWindow=RECV_WINDOW_MS)
+                return
+            except Exception as e:  # noqa: BLE001 - 只有 -2013 才回落，其它错误往上抛
+                if getattr(e, "code", None) != -2013:
+                    raise
+        self.client.futures_cancel_order(symbol=symbol, orderId=algo_id, recvWindow=RECV_WINDOW_MS)
+
+    def get_open_algo_orders(self, symbol: str) -> list:
+        """当前挂着的 algo（条件）单；旧版库没有此方法就返回空列表。"""
+        fn = getattr(self.client, "futures_get_open_algo_orders", None)
+        if fn is None:
+            return []
+        return list(fn(symbol=symbol, recvWindow=RECV_WINDOW_MS) or [])
 
     # ---------- 持仓查询 ----------
     def poll_exit_orders(self, symbol: str, position: dict) -> dict:
         """查止盈/止损订单状态。返回 {"closed", "kind"("TP"/"SL"), "exit_price", "exit_order_id"}。
-        成交的那条一经发现，立刻撤掉另一条（免得反手又成交）。"""
+        成交的那条一经发现，立刻撤掉另一条（免得反手又成交）。
+        止损是 algo 单：走 _query_stop_order（algo 查询），撤单走 cancel_algo_order；
+        止盈是普通 LIMIT 单：走普通查询/撤单。"""
         result = {"closed": False, "kind": None, "exit_price": None, "exit_order_id": None}
         for kind, oid in (("TP", position.get("tp_order_id")),
                           ("SL", position.get("sl_order_id"))):
             if not oid:
                 continue
             try:
-                order = self.client.futures_get_order(symbol=symbol, orderId=oid, recvWindow=RECV_WINDOW_MS)
+                if kind == "SL":
+                    stop = self._query_stop_order(symbol, oid)
+                    if not stop["triggered"]:
+                        continue
+                    result["closed"] = True
+                    result["kind"] = "SL"
+                    result["exit_price"] = stop["exit_price"]
+                    result["exit_order_id"] = stop["exit_order_id"]
+                else:
+                    order = self.client.futures_get_order(symbol=symbol, orderId=oid, recvWindow=RECV_WINDOW_MS)
+                    if order.get("status") != "FILLED":
+                        continue
+                    result["closed"] = True
+                    result["kind"] = "TP"
+                    result["exit_price"] = float(order.get("avgPrice") or 0) or None
+                    result["exit_order_id"] = oid
             except Exception as e:  # noqa: BLE001 - 查单失败不等于没成交，下轮再查
                 self.log(f"查订单 {oid} 失败：{e}，下轮再查。")
                 continue
-            if order.get("status") == "FILLED":
-                result["closed"] = True
-                result["kind"] = kind
-                result["exit_price"] = float(order.get("avgPrice") or 0) or None
-                result["exit_order_id"] = oid
+            if result["closed"]:
                 other = position.get("sl_order_id") if kind == "TP" else position.get("tp_order_id")
                 if other:
                     try:
-                        self.client.futures_cancel_order(symbol=symbol, orderId=other, recvWindow=RECV_WINDOW_MS)
+                        if kind == "TP":
+                            self.cancel_algo_order(symbol, other)
+                        else:
+                            self.client.futures_cancel_order(symbol=symbol, orderId=other, recvWindow=RECV_WINDOW_MS)
                     except Exception:  # noqa: BLE001 - 对方可能已撤/已成交，忽略
                         pass
                 break
@@ -515,7 +642,7 @@ class LiveTrader:
         old_sl = position.get("sl_order_id")
         if old_sl:
             try:
-                self.client.futures_cancel_order(symbol=symbol, orderId=old_sl, recvWindow=RECV_WINDOW_MS)
+                self.cancel_algo_order(symbol, old_sl)
             except Exception as e:  # noqa: BLE001 - 旧止损可能已成交，调用方下轮会发现平仓
                 self.log(f"保本撤旧止损 {old_sl} 失败：{e}，本次不移动。")
                 return False
@@ -739,6 +866,7 @@ def reconcile_live_positions(live_trader: LiveTrader, positions: dict,
         try:
             st = live_trader.get_position_state(symbol)
             open_orders = live_trader.get_open_orders(symbol)
+            open_algo_orders = live_trader.get_open_algo_orders(symbol)
         except Exception as e:  # noqa: BLE001
             log(f"对账失败：{symbol} 拉不到交易所状态（{e}），该币种暂停新开单，等下次重启再对。")
             blocked.add(symbol)
@@ -753,18 +881,31 @@ def reconcile_live_positions(live_trader: LiveTrader, positions: dict,
                         log(f"对账：{symbol} 无持仓，撤掉多余挂单 {o['orderId']}。")
                     except Exception:  # noqa: BLE001
                         pass
+                for o in open_algo_orders:
+                    try:
+                        live_trader.cancel_algo_order(symbol, o["algoId"])
+                        log(f"对账：{symbol} 无持仓，撤掉多余 algo 挂单 {o['algoId']}。")
+                    except Exception:  # noqa: BLE001
+                        pass
                 continue
             # state 有、交易所没有：停机期间已平仓，找最近成交的出场单算盈亏
             exit_price = None
             exit_order_id = None
             exit_order = None
             exit_time = -1
+            # 出场单：止损/止盈/市价平仓。双向模式下市价平仓不带 reduceOnly、
+            # 也不带 closePosition，要靠方向（side + positionSide）认；
+            # 触发后的止损在历史订单里是 MARKET 单、origType=STOP_MARKET。
+            exit_side = "SELL" if saved["side"] == "LONG" else "BUY"
             try:
                 for o in live_trader.get_all_orders(symbol):
                     if o.get("status") != "FILLED":
                         continue
-                    if o.get("reduceOnly") not in ("true", True) and \
-                            o.get("closePosition") not in ("true", True):
+                    is_exit = (o.get("reduceOnly") in ("true", True)
+                               or o.get("closePosition") in ("true", True)
+                               or (o.get("type") == "MARKET" and o.get("side") == exit_side
+                                   and o.get("positionSide") in (saved["side"], "BOTH")))
+                    if not is_exit:
                         continue
                     t = int(o.get("updateTime") or o.get("time") or 0)
                     if t >= exit_time:
@@ -788,7 +929,9 @@ def reconcile_live_positions(live_trader: LiveTrader, positions: dict,
                 pnl = live_close_pnl(saved, exit_price, fees)
             # 出场单是止损市价单且止损价不在成本价上，才算真的止损（影响冷却时长）；
             # 止损价已在成本价上就是保本出场，冷却按 15 分钟算。
-            was_sl = bool(exit_order and exit_order.get("type") == "STOP_MARKET"
+            # 触发后的 algo 止损在历史订单里 type=MARKET、origType=STOP_MARKET。
+            was_sl = bool(exit_order and (exit_order.get("type") == "STOP_MARKET"
+                          or exit_order.get("origType") == "STOP_MARKET")
                           and abs(float(exit_order.get("stopPrice") or 0) - saved["entry"]) > 1e-9)
             risk.record_trade_closed(symbol, pnl, was_sl=was_sl, now=time.time())
             positions[symbol] = None
@@ -798,9 +941,23 @@ def reconcile_live_positions(live_trader: LiveTrader, positions: dict,
         side = "LONG" if amt > 0 else "SHORT"
         qty = abs(amt)
         entry = st["entry"] or (saved or {}).get("entry", 0.0)
+        # 止损是 algo 单：普通挂单列表里没有，要到 algo 挂单列表里找
+        # （orderType=STOP_MARKET，触发价在 triggerPrice 里）。
         sl_order = next((o for o in open_orders if o.get("type") == "STOP_MARKET"), None)
+        if sl_order is None:
+            sl_algo = next((o for o in open_algo_orders
+                            if str(o.get("orderType") or "").upper() == "STOP_MARKET"
+                            and (not o.get("positionSide") or o.get("positionSide") == side)), None)
+            if sl_algo is not None:
+                sl_order = {"orderId": sl_algo.get("algoId"), "type": "STOP_MARKET",
+                            "stopPrice": sl_algo.get("triggerPrice") or sl_algo.get("stopPrice")}
+        # 止盈是普通 LIMIT 单：双向模式下不带 reduceOnly，靠方向认
+        # （side 是出场方向、positionSide 是持仓方向）；单向模式仍有 reduceOnly。
+        exit_side = "SELL" if side == "LONG" else "BUY"
         tp_order = next((o for o in open_orders
-                         if o.get("type") == "LIMIT" and o.get("reduceOnly") in ("true", True)), None)
+                         if o.get("type") == "LIMIT" and o.get("side") == exit_side
+                         and (o.get("reduceOnly") in ("true", True)
+                              or o.get("positionSide") == side)), None)
         if saved is None:
             log(f"严重：交易所里 {symbol} 有持仓 {side} {qty:.5f} @ {entry:.1f}，但 state.json 里没有！"
                 f"已认领并接管，绝不丢单。")
