@@ -92,12 +92,36 @@ NEWS_PAUSE_WINDOWS: list[tuple[str, str]] = [
     ("2026-12-15T13:00:00", "2026-12-15T14:00:00"),  # PPI（11 月），北京时间 12-15 21:30（BLS 核实）
 ]
 
+# ---------- 实盘入场等待（有界等待：超时未成交就撤单，绝不等死）----------
+ENTRY_FILL_TIMEOUT_SECONDS = 60  # Post Only 入场单最多等 60 秒
+ENTRY_POLL_SECONDS = 2           # 等成交时每 2 秒查一次订单状态
+
 # ---------- 运行模式 ----------
 # 默认 Dry-Run：只看行情、只记“本来会下的单”，绝不下真实单。
-# 实盘要同时满足：环境变量 BINANCE_LIVE_TRADING=1
-# 且 config.json 里 live_trading_enabled=true。缺一个都不开实盘。
+# 实盘要同时满足下面三项，缺一个都不开实盘（2026-11-14 接通实盘时把
+# BINANCE_LIVE_TRADING=1 的检查真正写进代码，之前只在注释里）：
+#   1. 环境变量 BINANCE_DRY_RUN=0
+#   2. config.json 里 live_trading_enabled=true
+#   3. 环境变量 BINANCE_LIVE_TRADING=1
 DRY_RUN = os.environ.get("BINANCE_DRY_RUN", "1") != "0"
 LIVE_TRADING_ENABLED = False  # 默认 False；config.json 可覆盖，但仍需环境变量配合
+
+
+def live_trading_missing() -> list[str]:
+    """返回实盘三项条件里缺了哪几项（空列表 = 三项全满足）。"""
+    missing = []
+    if DRY_RUN:
+        missing.append("BINANCE_DRY_RUN 不是 0（现在是 Dry-Run）")
+    if not LIVE_TRADING_ENABLED:
+        missing.append("config.json 里 live_trading_enabled 不是 true")
+    if os.environ.get("BINANCE_LIVE_TRADING", "0") != "1":
+        missing.append("环境变量 BINANCE_LIVE_TRADING 不是 1")
+    return missing
+
+
+def live_trading_active() -> bool:
+    """实盘开关：三项条件同时满足才返回 True。调用时才判断，不只看启动时的快照。"""
+    return not live_trading_missing()
 
 
 def load_config() -> dict:
