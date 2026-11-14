@@ -316,6 +316,58 @@ class LiveTrader:
         self.load_filters()
         self.log("实盘准备：交易所精度已加载。")
 
+    def _maker_retry_price(self, symbol: str, side: str) -> float | None:
+        """-5022 重挂用的 maker 安全价。做空取最优卖价，做多取最优买价；
+        拿不到盘口价返回 None（不重挂）。"""
+        try:
+            book = self.client.futures_orderbook_ticker(
+                symbol=symbol, recvWindow=RECV_WINDOW_MS)
+            px = float(book.get("askPrice") if side == "SHORT"
+                       else book.get("bidPrice") or 0)
+            if px <= 0:
+                return None
+            return self.round_price(symbol, px)
+        except Exception as e:  # noqa: BLE001 - 盘口拿不到就不重挂，调用方按被拒处理
+            self.log(f"取盘口价失败（{e}），不重挂。")
+            return None
+
+    def _create_entry_order(self, symbol: str, order_side: str, qty_r: float,
+                            price: float, side: str) -> dict:
+        """下 Post Only 入场单。-5022（会立即成交被拒）时按盘口现价重挂一次，
+        保证是 maker 单；重挂也被拒就抛 LiveOrderRejected。"""
+        try:
+            return self.client.futures_create_order(
+                symbol=symbol, side=order_side, type="LIMIT",
+                quantity=qty_r, price=price, timeInForce="GTX",
+                positionSide=self._pos_side(side), recvWindow=RECV_WINDOW_MS)
+        except Exception as e:  # noqa: BLE001 - 区分“会立即成交被拒”和其它异常
+            msg = str(e)
+            code = getattr(e, "code", None)
+            is_maker_reject = (
+                code == -5022
+                or ("maker" in msg.lower() and "post only" in msg.lower()))
+            if is_maker_reject:
+                retry_price = self._maker_retry_price(symbol, side)
+                if retry_price is None:
+                    raise LiveOrderRejected(
+                        f"Post Only 入场被拒（会立即成交）：{msg}")
+                self.log(f"Post Only 入场被拒（-5022），按现价 {retry_price} 重挂一次。")
+                try:
+                    return self.client.futures_create_order(
+                        symbol=symbol, side=order_side, type="LIMIT",
+                        quantity=qty_r, price=retry_price, timeInForce="GTX",
+                        positionSide=self._pos_side(side), recvWindow=RECV_WINDOW_MS)
+                except Exception as e2:  # noqa: BLE001 - 重挂失败就放弃
+                    msg2 = str(e2)
+                    code2 = getattr(e2, "code", None)
+                    if ("immediately" in msg2.lower()
+                            or code2 in (-2010, -2011, -5022)):
+                        raise LiveOrderRejected(f"Post Only 入场重挂也被拒：{msg2}")
+                    raise LiveOrderError(f"入场下单异常：{msg2}")
+            if "immediately" in msg.lower() or code in (-2010, -2011):
+                raise LiveOrderRejected(f"Post Only 入场被拒（会立即成交）：{msg}")
+            raise LiveOrderError(f"入场下单异常：{msg}")
+
     # ---------- 下单 ----------
     def place_entry(self, signal: dict, qty: float,
                     sleep_fn=time.sleep) -> dict:
@@ -329,17 +381,7 @@ class LiveTrader:
         qty_r = self.round_qty(symbol, qty)
         self._check_min_notional(symbol, price, qty_r)
         order_side = "BUY" if side == "LONG" else "SELL"
-        try:
-            order = self.client.futures_create_order(
-                symbol=symbol, side=order_side, type="LIMIT",
-                quantity=qty_r, price=price, timeInForce="GTX",
-                positionSide=self._pos_side(side), recvWindow=RECV_WINDOW_MS)
-        except Exception as e:  # noqa: BLE001 - 区分“会立即成交被拒”和其它异常
-            msg = str(e)
-            code = getattr(e, "code", None)
-            if "immediately" in msg.lower() or code in (-2010, -2011):
-                raise LiveOrderRejected(f"Post Only 入场被拒（会立即成交）：{msg}")
-            raise LiveOrderError(f"入场下单异常：{msg}")
+        order = self._create_entry_order(symbol, order_side, qty_r, price, side)
         order_id = order["orderId"]
         deadline = time.time() + ENTRY_FILL_TIMEOUT_SECONDS
         while time.time() < deadline:
