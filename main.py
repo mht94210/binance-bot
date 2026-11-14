@@ -229,12 +229,29 @@ class LiveTrader:
     def __init__(self, client, log_fn=None):
         self.client = client
         self.log = log_fn or log
+        self.hedge_mode = False  # 持仓模式：True=双向持仓（Hedge），False=单向持仓；启动时从交易所查
         self._tick: dict[str, float] = {}
         self._tick_decimals: dict[str, int] = {}
         self._step: dict[str, float] = {}
         self._step_decimals: dict[str, int] = {}
         self._min_qty: dict[str, float] = {}
         self._min_notional: dict[str, float] = {}
+
+    def _pos_side(self, side: str) -> str:
+        """下单用的 positionSide。双向持仓模式下必须写 LONG/SHORT（不写会被
+        币安 -4061 拒单）；单向持仓模式下写 BOTH。side 是持仓方向 LONG/SHORT。"""
+        return side if self.hedge_mode else "BOTH"
+
+    def _detect_position_mode(self) -> None:
+        """启动时查账户持仓模式（futures_get_position_mode），dualSidePosition
+        为 True 就是双向持仓。查不到就默认单向并记警告（-4061 会暴露出来）。"""
+        try:
+            res = self.client.futures_get_position_mode(recvWindow=RECV_WINDOW_MS)
+            self.hedge_mode = bool(res.get("dualSidePosition"))
+            self.log(f"实盘准备：账户持仓模式={'双向持仓' if self.hedge_mode else '单向持仓'}。")
+        except Exception as e:  # noqa: BLE001 - 查不到就默认单向，下单被拒时会再暴露
+            self.hedge_mode = False
+            self.log(f"实盘准备警告：查持仓模式失败（{e}），默认按单向持仓下单。")
 
     # ---------- 精度（下单前必须从交易所拿 filters，否则价格/数量可能被拒）----------
     @staticmethod
@@ -284,7 +301,8 @@ class LiveTrader:
     # ---------- 账户准备（启动时一次）----------
     def setup_account(self) -> None:
         """逐仓 + 10 倍杠杆 + 精度。杠杆/逐仓设不上只记警告（可能已经是目标值），
-        但精度拿不到必须抛错。"""
+        但精度拿不到必须抛错。先查持仓模式（双向/单向），下单要带对应的 positionSide。"""
+        self._detect_position_mode()
         for symbol in SYMBOLS:
             try:
                 res = self.client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE, recvWindow=RECV_WINDOW_MS)
@@ -314,7 +332,8 @@ class LiveTrader:
         try:
             order = self.client.futures_create_order(
                 symbol=symbol, side=order_side, type="LIMIT",
-                quantity=qty_r, price=price, timeInForce="GTX", recvWindow=RECV_WINDOW_MS)
+                quantity=qty_r, price=price, timeInForce="GTX",
+                positionSide=self._pos_side(side), recvWindow=RECV_WINDOW_MS)
         except Exception as e:  # noqa: BLE001 - 区分“会立即成交被拒”和其它异常
             msg = str(e)
             code = getattr(e, "code", None)
@@ -360,7 +379,8 @@ class LiveTrader:
         exit_side = "SELL" if side == "LONG" else "BUY"
         order = self.client.futures_create_order(
             symbol=symbol, side=exit_side, type="STOP_MARKET",
-            stopPrice=self.round_price(symbol, stop_price), closePosition="true", recvWindow=RECV_WINDOW_MS)
+            stopPrice=self.round_price(symbol, stop_price), closePosition="true",
+            positionSide=self._pos_side(side), recvWindow=RECV_WINDOW_MS)
         return order["orderId"]
 
     def place_take_profit(self, symbol: str, side: str, qty: float, tp_price: float) -> int:
@@ -370,7 +390,8 @@ class LiveTrader:
             symbol=symbol, side=exit_side, type="LIMIT",
             quantity=self.round_qty(symbol, qty),
             price=self.round_price(symbol, tp_price),
-            timeInForce="GTC", reduceOnly="true", recvWindow=RECV_WINDOW_MS)
+            timeInForce="GTC", reduceOnly="true",
+            positionSide=self._pos_side(side), recvWindow=RECV_WINDOW_MS)
         return order["orderId"]
 
     def place_protection(self, symbol: str, side: str, qty: float,
@@ -396,7 +417,8 @@ class LiveTrader:
         exit_side = "SELL" if side == "LONG" else "BUY"
         return self.client.futures_create_order(
             symbol=symbol, side=exit_side, type="MARKET",
-            quantity=self.round_qty(symbol, qty), reduceOnly="true", recvWindow=RECV_WINDOW_MS)
+            quantity=self.round_qty(symbol, qty), reduceOnly="true",
+            positionSide=self._pos_side(side), recvWindow=RECV_WINDOW_MS)
 
     # ---------- 持仓查询 ----------
     def poll_exit_orders(self, symbol: str, position: dict) -> dict:
