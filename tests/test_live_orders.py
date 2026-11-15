@@ -14,6 +14,11 @@ import sys
 import time
 from pathlib import Path
 
+try:
+    import pytest
+except ImportError:  # 直接 python3 运行测试文件时 pytest 未装：类测试跳过
+    pytest = None  # type: ignore[assignment]
+
 # 导入 main 会启动 health server（读 $PORT）：绑 0 号端口（系统自动分配），免得占 3000。
 os.environ["PORT"] = "0"
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -1211,3 +1216,48 @@ if __name__ == "__main__":
         print(f"FAILED: {len(FAILURES)} 项")
         sys.exit(1)
     print("ALL PASS")
+
+
+# --- 持仓模式检测：-1021 重试与拒绝启动（2026-11-15 quwuwp51 启动警告） ---
+class TestDetectPositionModeRetry:
+    """_detect_position_mode：-1021 时重试 5 次；5 次都失败则抛错拒绝启动，
+    绝不默认单向（默认单向会让双向账户的每单都被 -4061 拒单）。"""
+
+    def _trader_with_mode_calls(self, results):
+        """results 是每次 futures_get_position_mode 的返回值或抛出的异常。"""
+        trader = LiveTrader(FakeClient(), log_fn=capture_log)
+        calls = {"n": 0}
+
+        def fake_mode(recvWindow=None):
+            item = results[min(calls["n"], len(results) - 1)]
+            calls["n"] += 1
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        trader.client.futures_get_position_mode = fake_mode
+        return trader, calls
+
+    def test_retry_then_success_hedge(self, monkeypatch):
+        monkeypatch.setattr(time, "sleep", lambda s: None)
+        err = FakeBinanceAPIException(-1021, "Timestamp for this request is outside of the recvWindow.")
+        trader, calls = self._trader_with_mode_calls([err, err, {"dualSidePosition": True}])
+        trader._detect_position_mode()
+        assert trader.hedge_mode is True
+        assert calls["n"] == 3
+
+    def test_retry_then_success_oneway(self, monkeypatch):
+        monkeypatch.setattr(time, "sleep", lambda s: None)
+        err = FakeBinanceAPIException(-1021, "Timestamp for this request is outside of the recvWindow.")
+        trader, calls = self._trader_with_mode_calls([err, {"dualSidePosition": False}])
+        trader._detect_position_mode()
+        assert trader.hedge_mode is False
+        assert calls["n"] == 2
+
+    def test_all_retries_fail_raises(self, monkeypatch):
+        monkeypatch.setattr(time, "sleep", lambda s: None)
+        err = FakeBinanceAPIException(-1021, "Timestamp for this request is outside of the recvWindow.")
+        trader, calls = self._trader_with_mode_calls([err])
+        with pytest.raises(RuntimeError, match="查持仓模式 5 次都失败"):
+            trader._detect_position_mode()
+        assert calls["n"] == 5

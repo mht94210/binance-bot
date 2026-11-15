@@ -258,14 +258,23 @@ class LiveTrader:
 
     def _detect_position_mode(self) -> None:
         """启动时查账户持仓模式（futures_get_position_mode），dualSidePosition
-        为 True 就是双向持仓。查不到就默认单向并记警告（-4061 会暴露出来）。"""
-        try:
-            res = self.client.futures_get_position_mode(recvWindow=RECV_WINDOW_MS)
-            self.hedge_mode = bool(res.get("dualSidePosition"))
-            self.log(f"实盘准备：账户持仓模式={'双向持仓' if self.hedge_mode else '单向持仓'}。")
-        except Exception as e:  # noqa: BLE001 - 查不到就默认单向，下单被拒时会再暴露
-            self.hedge_mode = False
-            self.log(f"实盘准备警告：查持仓模式失败（{e}），默认按单向持仓下单。")
+        为 True 就是双向持仓。查不到就重试 5 次（每次隔 10 秒，容器时钟刚启动
+        可能还没对准，-1021 常是暂时的）；5 次都失败就直接抛错拒绝启动——
+        绝不能默认单向：账户实际是双向持仓时，默认单向会导致每单都被 -4061
+        拒单，机器人等于白跑。"""
+        last_exc: Exception | None = None
+        for attempt in range(5):
+            try:
+                res = self.client.futures_get_position_mode(recvWindow=RECV_WINDOW_MS)
+                self.hedge_mode = bool(res.get("dualSidePosition"))
+                self.log(f"实盘准备：账户持仓模式={'双向持仓' if self.hedge_mode else '单向持仓'}。")
+                return
+            except Exception as e:  # noqa: BLE001 - 重试；5 次都失败才抛错
+                last_exc = e
+                if attempt < 4:
+                    self.log(f"实盘准备：查持仓模式失败（{e}），10 秒后重试（{attempt + 1}/5）。")
+                    time.sleep(10)
+        raise RuntimeError(f"查持仓模式 5 次都失败（{last_exc}），无法确定下单该带哪种 positionSide，拒绝启动。")
 
     # ---------- 精度（下单前必须从交易所拿 filters，否则价格/数量可能被拒）----------
     @staticmethod
