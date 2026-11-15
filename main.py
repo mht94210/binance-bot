@@ -20,7 +20,7 @@ Binance BTC+ETH 永续合约短线机器人 —— 10 倍快进快出方案（�
 
 策略（写死在 config.py）：
 - 10 倍杠杆，一单最多 400 U 保证金，名义仓位 4000 U
-- 信号：15 分钟 K 线收盘时判断（4 小时 EMA200 + 1 小时 EMA200 同向定方向 + 15 分钟 ADX>30 + 15 分钟均线，3/3 全票）
+- 信号：15 分钟 K 线收盘时判断（4 小时 EMA50 + 1 小时 EMA50 同向定方向 + 15 分钟 ADX>30 + 15 分钟均线，3/3 全票）
 - 止损 2 倍 ATR，止盈 3 倍 ATR，盈亏比 1:1.5；止盈目标 < 0.30% 不做
 - 赚到 1 倍风险就把止损移到成本价（保本）；进场限价单，止损市价单
 - 冷却 15 分钟，止损后 30 分钟；每个币种每天最多 10 单、同时最多 1 单
@@ -161,7 +161,7 @@ def compute_indicators(symbol: str) -> dict | None:
     """拉三组 K 线，算出信号要用的全部指标。失败返回 None。
     只用已收盘的 K 线（去掉每组最后一根未收盘的）。
     信号周期 15 分钟（2026-11-11 用户决定少而精：5 分钟噪音太多）；
-    4 小时 EMA200 做大趋势过滤，1 小时 EMA200 定方向。"""
+    4 小时 EMA50 做大趋势过滤，1 小时 EMA50 定方向。"""
     k15 = get_klines(symbol, "15m", 40)
     k1h = get_klines(symbol, "1h", 210)
     k4h = get_klines(symbol, "4h", 210)
@@ -184,8 +184,8 @@ def compute_indicators(symbol: str) -> dict | None:
         "candle_open_time": closed15[-1]["open_time"],
         "price": closed15[-1]["close"],
         "atr": atr_value,
-        "ema200_1h": ema(closes1h, EMA_PERIOD_1H),
-        "ema200_4h": ema(closes4h, EMA_PERIOD_4H),
+        "ema50_1h": ema(closes1h, EMA_PERIOD_1H),
+        "ema50_4h": ema(closes4h, EMA_PERIOD_4H),
         "adx15": adx_value,
         "ma_fast": sma(closes15, MA_FAST_PERIOD),
         "ma_slow": sma(closes15, MA_SLOW_PERIOD),
@@ -1071,7 +1071,7 @@ def main() -> None:
     log("=" * 60)
     log("BTC+ETH 合约短线机器人启动（10 倍快进快出方案，2026-11-10 用户确认；2026-11-11 加 ETH）")
     log(f"标的: {', '.join(SYMBOLS)} | Dry-Run: {DRY_RUN} | 实盘开关: {LIVE_TRADING_ENABLED} | 实盘已开: {live_trading_active()}")
-    log("策略: 15m 共振少而精（4h EMA200 + 1h EMA200 定方向 + 15m ADX>30 + 15m 均线，3/3 全票）+ 量能过滤；"
+    log("策略: 15m 共振少而精（4h EMA50 + 1h EMA50 定方向 + 15m ADX>30 + 15m 均线，3/3 全票）+ 量能过滤；"
         "止损 2 倍 ATR，止盈 3 倍 ATR，盈亏比 1:1.5；赚 1 倍风险保本；"
         "进场限价单，止损市价单；冷却 15 分钟（止损后 30 分钟，3/3 强信号可跳过）；"
         "每个币种一天最多 10 单、同时最多 1 单（全账户同时最多 2 单）")
@@ -1291,8 +1291,8 @@ def main() -> None:
             # 入场按判断时的实时价，不用滞后的 5 分钟 K 线收盘价（2026-11-10 的教训：
             # 收盘价 72964.9 开单时实时价已到约 73290，差了 325 点）
             signal = evaluate(price=price, atr=indicators["atr"],
-                              ema200_1h=indicators["ema200_1h"],
-                              ema200_4h=indicators["ema200_4h"], adx15=indicators["adx15"],
+                              ema50_1h=indicators["ema50_1h"],
+                              ema50_4h=indicators["ema50_4h"], adx15=indicators["adx15"],
                               ma_fast=indicators["ma_fast"], ma_slow=indicators["ma_slow"],
                               midline=indicators["midline"],
                               volume=indicators["volume"], volume_sma=indicators["volume_sma"],

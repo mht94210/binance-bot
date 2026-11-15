@@ -4,7 +4,7 @@
 版本：2026-11-10 用户确认（综合 3Commas / Cryptohopper / Pionex / Freqtrade 等做法后定）。
 2026-11-11 用户决定改成少而精：信号 15 分钟，3/3 全票，ADX>30，加 4 小时趋势过滤，保证金 400 U/单。
 - 信号周期：15 分钟 K 线收盘时判断；持仓管理每 5 秒轮询（止盈止损 / 保本）。
-- 五道闸门：4 小时 EMA200 和 1 小时 EMA200 同向才做（上方只做多、下方只做空，
+- 五道闸门：4 小时 EMA50 和 1 小时 EMA50 同向才做（上方只做多、下方只做空，
   两条线方向不一致不动）；15 分钟 ADX 必须 >30（没趋势不动）；
   均线方向、分界线、量能三项必须全中（3/3 全票）；
   止盈目标 < 0.30% 不做；冷却与额度由风控器管。
@@ -48,8 +48,8 @@ def _votes_short(price: float, ma_fast: float | None, ma_slow: float | None,
     return votes
 
 
-def evaluate(price: float, atr: float | None, ema200_1h: float | None,
-             ema200_4h: float | None,
+def evaluate(price: float, atr: float | None, ema50_1h: float | None,
+             ema50_4h: float | None,
              adx15: float | None, ma_fast: float | None, ma_slow: float | None,
              midline: float | None,
              volume: float | None, volume_sma: float | None,
@@ -62,7 +62,7 @@ def evaluate(price: float, atr: float | None, ema200_1h: float | None,
     被某道闸门挡住时，如传了 log 就记一条原因，方便查为什么没开单。
 
     五道闸门：
-    1. 方向：4 小时 EMA200 和 1 小时 EMA200 同向才做（上方只做多、下方只做空，
+    1. 方向：4 小时 EMA50 和 1 小时 EMA50 同向才做（上方只做多、下方只做空，
        两条线方向不一致不动）；
     2. 强度：15 分钟 ADX 必须 >30，否则说明没趋势；
     3. 共振：均线方向、分界线、量能三项必须全中（3/3 全票）；
@@ -76,10 +76,10 @@ def evaluate(price: float, atr: float | None, ema200_1h: float | None,
 
     if atr is None or atr <= 0:
         return _blocked("ATR 还没算出来（15 分钟 K 线不够 15 根），等预热。")
-    if ema200_1h is None:
-        return _blocked("1 小时 EMA200 还没算出来（1 小时 K 线不够 200 根），等预热。")
-    if ema200_4h is None:
-        return _blocked("4 小时 EMA200 还没算出来（4 小时 K 线不够 200 根），等预热。")
+    if ema50_1h is None:
+        return _blocked("1 小时 EMA50 还没算出来（1 小时 K 线不够 200 根），等预热。")
+    if ema50_4h is None:
+        return _blocked("4 小时 EMA50 还没算出来（4 小时 K 线不够 200 根），等预热。")
     if adx15 is None:
         return _blocked("15 分钟 ADX 还没算出来，等预热。")
     if ma_fast is None or ma_slow is None:
@@ -95,7 +95,7 @@ def evaluate(price: float, atr: float | None, ema200_1h: float | None,
     stop_distance = SL_ATR_MULT * atr
     take_distance = TP_ATR_MULT * atr
 
-    if price > ema200_1h and price > ema200_4h:
+    if price > ema50_1h and price > ema50_4h:
         votes = _votes_long(price, ma_fast, ma_slow, midline, volume, volume_sma)
         if votes < 3:
             return _blocked(f"做多共振不足：{votes}/3 票（均线/分界线/量能），要 3 票全中。")
@@ -108,11 +108,11 @@ def evaluate(price: float, atr: float | None, ema200_1h: float | None,
             "take_profit_2": None,
             "atr": atr,
             "votes": votes,
-            "reason": f"15m 共振做多 {votes}/3 票（4h+1h EMA200 上方/ADX {adx15:.0f}/均线多头），"
+            "reason": f"15m 共振做多 {votes}/3 票（4h+1h EMA50 上方/ADX {adx15:.0f}/均线多头），"
                       f"止损 {stop_distance:.0f} 点，止盈 {take_distance:.0f} 点",
             "mode": "scalp10x",
         }
-    if price < ema200_1h and price < ema200_4h:
+    if price < ema50_1h and price < ema50_4h:
         votes = _votes_short(price, ma_fast, ma_slow, midline, volume, volume_sma)
         if votes < 3:
             return _blocked(f"做空共振不足：{votes}/3 票（均线/分界线/量能），要 3 票全中。")
@@ -125,8 +125,8 @@ def evaluate(price: float, atr: float | None, ema200_1h: float | None,
             "take_profit_2": None,
             "atr": atr,
             "votes": votes,
-            "reason": f"15m 共振做空 {votes}/3 票（4h+1h EMA200 下方/ADX {adx15:.0f}/均线空头），"
+            "reason": f"15m 共振做空 {votes}/3 票（4h+1h EMA50 下方/ADX {adx15:.0f}/均线空头），"
                       f"止损 {stop_distance:.0f} 点，止盈 {take_distance:.0f} 点",
             "mode": "scalp10x",
         }
-    return _blocked("4 小时和 1 小时 EMA200 方向不一致（或现价压在 EMA200 上），只顺大方向做，不动。")
+    return _blocked("4 小时和 1 小时 EMA50 方向不一致（或现价压在 EMA50 上），只顺大方向做，不动。")
