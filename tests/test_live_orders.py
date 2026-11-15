@@ -82,6 +82,7 @@ class FakeClient:
         self.exchange_info_ok = True
         self.book = {}  # symbol -> (bid, ask)；不设就按 marks 给一个小点差
         self.fail_book_ticker = False
+        self.fail_position_symbols = set()  # 这些币种拉持仓信息时抛错（对账失败回归用）
         # --- algo 单模拟（新版 python-binance >=1.0.33 的行为）---
         # 默认关闭：STOP_MARKET 走普通订单（旧版行为），现有测试不动。
         # algo_routing=True 时：STOP_MARKET 返回 algoId（无 orderId），
@@ -299,6 +300,8 @@ class FakeClient:
         return rows[-limit:]
 
     def futures_position_information(self, symbol=None, recvWindow=None):
+        if symbol in self.fail_position_symbols:
+            raise FakeBinanceAPIException(-1000, "position info unavailable")
         out = []
         for s in (["BTCUSDT", "ETHUSDT"] if symbol is None else [symbol]):
             out.append({"symbol": s, "positionAmt": str(self.positions[s]),
@@ -753,23 +756,25 @@ def test_oneway_mode_position_side():
 def test_entry_5022_retries_at_book_price():
     """2026-11-15 实盘 BTC SHORT @65330.4 因 -5022 丢单：Post Only 限价单
     到币安时价格已穿过盘口（会立即成交），被拒。修复：-5022 后按盘口
-    现价重挂一次（做空取最优卖价，做多取最优买价），保证是 maker 单。"""
+    现价重挂一次（做空取最优卖价，做多取最优买价），保证是 maker 单；
+    重挂价留 0.05% 缓冲（2026-11-15 实盘 ETH：贴盘口的价 1 秒内又被穿，
+    重挂再被 -5022 拒）。"""
     saved = save_gate()
     try:
         enable_live_gate()
         client, trader = make_trader(auto_fill_entry=True)
-        client.book["BTCUSDT"] = (69990.0, 70010.0)  # 做空重挂取卖价 70010
+        client.book["BTCUSDT"] = (69990.0, 70010.0)  # 做空重挂取卖价 70010 + 0.05% 缓冲 = 70045
         client.fail_create = FakeBinanceAPIException(
             -5022, "Due to the order could not be executed as maker, "
                    "the Post Only order will be rejected.")
         pos = place_order_live(make_signal(), 0.02, 140.0, trader, set())
         check(pos is not None, "-5022 回归：重挂后入场成交")
-        check(abs(pos["entry"] - 70010.0) < 1e-9, "-5022 回归：重挂价是最优卖价")
+        check(abs(pos["entry"] - 70045.0) < 1e-9, "-5022 回归：重挂价是最优卖价+0.05%缓冲")
         entry_orders = [o for o in client.orders.values()
                         if o["type"] == "LIMIT" and o.get("timeInForce") == "GTX"]
         check(len(entry_orders) == 1, "-5022 回归：只下一张入场单（重挂那张）")
-        check(abs(float(entry_orders[0]["price"]) - 70010.0) < 1e-9,
-              "-5022 回归：入场单价格是盘口卖价")
+        check(abs(float(entry_orders[0]["price"]) - 70045.0) < 1e-9,
+              "-5022 回归：入场单价格是盘口卖价+0.05%缓冲")
     finally:
         restore_gate(saved)
 
@@ -815,6 +820,70 @@ def test_entry_5022_no_book_ticker_abandons():
         check(client.positions["BTCUSDT"] == 0.0, "-5022 回归：无盘口价时无持仓")
     finally:
         restore_gate(saved)
+
+
+def test_maker_retry_price_has_buffer():
+    """-5022 重挂价留 0.05% 缓冲：做空=最优卖价+0.05%，做多=最优买价-0.05%。
+    贴盘口的价一秒内被穿就再被拒（2026-11-15 实盘 ETH 遇到过）。"""
+    client, trader = make_trader(auto_fill_entry=True)
+    client.book["BTCUSDT"] = (69990.0, 70010.0)
+    check(abs(trader._maker_retry_price("BTCUSDT", "SHORT") - 70045.0) < 1e-9,
+          "重挂价缓冲：做空取卖价+0.05%")
+    check(abs(trader._maker_retry_price("BTCUSDT", "LONG") - 69955.0) < 1e-9,
+          "重挂价缓冲：做多取买价-0.05%")
+
+
+# ---------- 2026-11-15 回归：启动对账失败不能永久堵死币种 ----------
+def test_reconcile_fetch_failure_blocks_but_retryable():
+    """2026-11-15 实盘事故：BTC 启动对账一次拉不到交易所状态，之后 6 个 3/3
+    信号全被“实盘对账异常”挡掉，15 小时没开出一单。修复：拉不到状态的币种
+    暂停新开单，但记进 retryable，主循环每 15 分钟重试，成功自动解除。"""
+    client, trader = make_trader(auto_fill_entry=True)
+    client.fail_position_symbols = {"BTCUSDT"}  # 只 BTC 拉不到，ETH 正常
+    positions = {"BTCUSDT": None, "ETHUSDT": None}
+    risk = RiskManager(["BTCUSDT", "ETHUSDT"])
+    blocked = set()
+    retryable = set()
+    reconcile_live_positions(trader, positions, risk, blocked, lambda: None,
+                             retryable=retryable)
+    check("BTCUSDT" in blocked, "对账拉不到：BTC 暂停新开单")
+    check("BTCUSDT" in retryable, "对账拉不到：BTC 记进可重试")
+    check("ETHUSDT" not in blocked, "对账拉不到：ETH 不受影响")
+    check("ETHUSDT" not in retryable, "对账拉不到：ETH 不进可重试")
+
+
+def test_reconcile_retry_unblocks_after_transient_failure():
+    """瞬时失败恢复后重试对账：BTC 解除暂停，可正常开单。"""
+    client, trader = make_trader(auto_fill_entry=True)
+    client.fail_position_symbols = {"BTCUSDT"}
+    positions = {"BTCUSDT": None, "ETHUSDT": None}
+    risk = RiskManager(["BTCUSDT", "ETHUSDT"])
+    blocked = set()
+    retryable = set()
+    reconcile_live_positions(trader, positions, risk, blocked, lambda: None,
+                             retryable=retryable)
+    check("BTCUSDT" in blocked, "重试前：BTC 仍暂停")
+    client.fail_position_symbols = set()  # 网络恢复
+    reconcile_live_positions(trader, positions, risk, blocked, lambda: None,
+                             symbols=["BTCUSDT"], retryable=retryable)
+    check("BTCUSDT" not in blocked, "重试成功：BTC 解除暂停")
+    check("BTCUSDT" not in retryable, "重试成功：BTC 移出可重试")
+
+
+def test_reconcile_hard_failure_not_retryable():
+    """裸仓市价平仓也失败（交易所仍有持仓）：暂停但不进可重试，等人工处理。"""
+    client, trader = make_trader(auto_fill_entry=True)
+    client.positions["BTCUSDT"] = -0.02
+    client.entries["BTCUSDT"] = 70000.0
+    client.fail_create = FakeBinanceAPIException(-1000, "market close unavailable")
+    positions = {"BTCUSDT": None, "ETHUSDT": None}
+    risk = RiskManager(["BTCUSDT", "ETHUSDT"])
+    blocked = set()
+    retryable = set()
+    reconcile_live_positions(trader, positions, risk, blocked, lambda: None,
+                             retryable=retryable)
+    check("BTCUSDT" in blocked, "硬失败：BTC 暂停新开单")
+    check("BTCUSDT" not in retryable, "硬失败：BTC 不进可重试（等人工处理）")
 
 
 # ---------- -1106 回归：双向持仓模式下不许带 reduceOnly ----------
@@ -1117,6 +1186,10 @@ if __name__ == "__main__":
     test_entry_5022_retries_at_book_price()
     test_entry_5022_retry_also_rejected()
     test_entry_5022_no_book_ticker_abandons()
+    test_maker_retry_price_has_buffer()
+    test_reconcile_fetch_failure_blocks_but_retryable()
+    test_reconcile_retry_unblocks_after_transient_failure()
+    test_reconcile_hard_failure_not_retryable()
     test_market_close_hedge_mode_no_reduce_only()
     test_market_close_oneway_mode_has_reduce_only()
     test_market_close_1106_retries_without_reduce_only()

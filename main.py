@@ -14,7 +14,9 @@ Binance BTC+ETH 永续合约短线机器人 —— 10 倍快进快出方案（�
   本仓库不含任何真实 Key、Secret、账号、密码。
 - 实盘持仓以交易所为准：止盈止损挂在交易所，轮询订单状态判断成交，
   不再用 ticker 价模拟成交；挂保护失败立刻市价平仓，绝不留裸仓。
-  启动时拉一次交易所持仓对账，孤儿持仓绝不能丢。
+  启动时拉一次交易所持仓对账，孤儿持仓绝不能丢；启动对账拉不到状态的币种
+  主循环每 15 分钟重试一次，成功自动解除暂停（2026-11-15 的教训：一次瞬时失败
+  不能永久堵死一个币种）。
 
 策略（写死在 config.py）：
 - 10 倍杠杆，一单最多 400 U 保证金，名义仓位 4000 U
@@ -57,8 +59,10 @@ from config import (
     MA_FAST_PERIOD,
     MA_SLOW_PERIOD,
     MAKER_FEE_PCT,
+    MAKER_RETRY_BUFFER_PCT,
     MAX_DAILY_LOSS_USDT,
     MAX_OPEN_POSITIONS,
+    RECONCILE_RETRY_SECONDS,
     RECV_WINDOW_MS,
     SYMBOLS,
     TAKER_FEE_PCT,
@@ -327,8 +331,9 @@ class LiveTrader:
         self.log("实盘准备：交易所精度已加载。")
 
     def _maker_retry_price(self, symbol: str, side: str) -> float | None:
-        """-5022 重挂用的 maker 安全价。做空取最优卖价，做多取最优买价；
-        拿不到盘口价返回 None（不重挂）。"""
+        """-5022 重挂用的 maker 安全价。做空取最优卖价 +0.05%，做多取最优买价 -0.05%；
+        刚好贴在盘口上的价一秒内就可能被穿、重挂再被拒（2026-11-15 实盘 ETH 遇到过），
+        留一点缓冲仍是 maker 单。拿不到盘口价返回 None（不重挂）。"""
         try:
             book = self.client.futures_orderbook_ticker(
                 symbol=symbol, recvWindow=RECV_WINDOW_MS)
@@ -336,6 +341,10 @@ class LiveTrader:
                        else book.get("bidPrice") or 0)
             if px <= 0:
                 return None
+            if side == "SHORT":
+                px = px * (1 + MAKER_RETRY_BUFFER_PCT)
+            else:
+                px = px * (1 - MAKER_RETRY_BUFFER_PCT)
             return self.round_price(symbol, px)
         except Exception as e:  # noqa: BLE001 - 盘口拿不到就不重挂，调用方按被拒处理
             self.log(f"取盘口价失败（{e}），不重挂。")
@@ -851,8 +860,11 @@ def manage_live_position(symbol: str, position: dict, price: float, now: float,
 
 
 def reconcile_live_positions(live_trader: LiveTrader, positions: dict,
-                             risk: RiskManager, blocked: set, save_state) -> None:
-    """实盘启动对账：交易所持仓 vs state.json（只在实盘启动时跑一次）。
+                             risk: RiskManager, blocked: set, save_state,
+                             symbols: list[str] | None = None,
+                             retryable: set | None = None) -> None:
+    """实盘启动对账：交易所持仓 vs state.json（启动时跑一次；启动失败的币种
+    主循环每 15 分钟重试一次，见 main）。
     - 交易所没有、state 有：持仓已在停机期间平掉（止损/止盈成交），按成交订单的均价平账；
       查不到成交价就按现价估算并大声记一笔。
     - 交易所和 state 都有：以交易所的数量/入场价为准；止损/止盈订单丢了就重挂，
@@ -861,16 +873,25 @@ def reconcile_live_positions(live_trader: LiveTrader, positions: dict,
       缺哪条按策略盈亏比（止盈 = 1.5 倍止损距离）从另一条反推重建；两条都没有
       就立刻市价平仓。认领后该币种随持仓自动停新单（每币种最多 1 单）。
     - 交易所和 state 都没有，但有挂单：多余挂单全撤掉，免得以后意外成交。
-    对账本身拉不到交易所状态：该币种加进 blocked，暂停新开单，等下次重启再对。"""
-    for symbol in SYMBOLS:
+    对账本身拉不到交易所状态：该币种加进 blocked，暂停新开单，同时记进 retryable，
+    主循环定期重试，成功自动解除。市价平仓也失败（交易所仍有持仓）才需人工处理，
+    那种不进 retryable。"""
+    for symbol in (symbols or SYMBOLS):
         try:
             st = live_trader.get_position_state(symbol)
             open_orders = live_trader.get_open_orders(symbol)
             open_algo_orders = live_trader.get_open_algo_orders(symbol)
         except Exception as e:  # noqa: BLE001
-            log(f"对账失败：{symbol} 拉不到交易所状态（{e}），该币种暂停新开单，等下次重启再对。")
+            log(f"对账失败：{symbol} 拉不到交易所状态（{e}），该币种暂停新开单，主循环每 15 分钟重试对账。")
             blocked.add(symbol)
+            if retryable is not None:
+                retryable.add(symbol)
             continue
+        # 拉到状态就说明交易所通了：先解除暂停；后面真发现裸仓平不掉再加回去。
+        # retryable 也清掉：硬失败（裸仓平不掉）不进 retryable，不会被定期重试。
+        blocked.discard(symbol)
+        if retryable is not None:
+            retryable.discard(symbol)
         amt = st["amt"]
         saved = positions.get(symbol)
         if amt == 0:
@@ -1067,6 +1088,7 @@ def main() -> None:
     # 持仓心跳每 20 秒记一行（止损每 5 秒都查，只是不每轮都写日志）。
     last_flat_eval: dict[str, float] = {s: 0.0 for s in SYMBOLS}
     last_heartbeat_log: dict[str, float] = {s: 0.0 for s in SYMBOLS}
+    last_reconcile_retry = 0.0  # 上次重试对账的时间（启动对账失败的币种定期重试用）
 
     def save_state() -> None:
         state_file.write_text(json.dumps({
@@ -1126,6 +1148,7 @@ def main() -> None:
     # 实盘：建下单器 + 启动对账（下单器建不起来就拒绝启动，绝不半实盘跑）
     live_trader = None
     live_blocked: set = set()
+    live_blocked_retryable: set = set()  # 启动对账失败（瞬时拉不到交易所状态）的币种：主循环定期重试
     if live_trading_active():
         try:
             api_key, api_secret = load_api_credentials()
@@ -1134,7 +1157,8 @@ def main() -> None:
         except Exception as e:  # noqa: BLE001
             log(f"已拒绝启动：实盘下单器创建失败：{e}")
             return
-        reconcile_live_positions(live_trader, positions, risk, live_blocked, save_state)
+        reconcile_live_positions(live_trader, positions, risk, live_blocked,
+                                 save_state, retryable=live_blocked_retryable)
 
     while True:
         if stop_file.exists():
@@ -1157,6 +1181,26 @@ def main() -> None:
 
         now = time.time()
         any_holding = False
+
+        # 启动对账失败不能永久堵死币种：每 15 分钟重试一次，成功自动解除暂停
+        # （2026-11-15 实盘事故：BTC 启动对账一次失败，之后 6 个 3/3 信号全被挡）。
+        if (live_trader is not None and live_blocked_retryable
+                and now - last_reconcile_retry >= RECONCILE_RETRY_SECONDS):
+            last_reconcile_retry = now
+            retry_syms = sorted(s for s in live_blocked_retryable if s in live_blocked)
+            if retry_syms:
+                log(f"对账重试：{', '.join(retry_syms)} 启动对账失败，重新拉交易所状态。")
+                reconcile_live_positions(live_trader, positions, risk, live_blocked,
+                                         save_state, symbols=retry_syms,
+                                         retryable=live_blocked_retryable)
+                for s in retry_syms:
+                    if s not in live_blocked:
+                        live_blocked_retryable.discard(s)
+                        log(f"对账重试成功：{s} 已解除暂停，可正常开单。")
+                still = [s for s in retry_syms if s in live_blocked]
+                if still:
+                    log(f"对账重试仍失败：{', '.join(still)}，"
+                        f"{RECONCILE_RETRY_SECONDS // 60} 分钟后再试。")
 
         for symbol in SYMBOLS:
             price = get_price_dry_run(symbol)
