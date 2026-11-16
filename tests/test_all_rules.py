@@ -68,6 +68,28 @@ def test_no_adx_gate():
     check(evaluate(**base_kwargs(adx15=None)) is None, "A ADX 缺失仍挡住（预热期）")
 
 
+def test_overextension_filter():
+    # 2026-11-16 用户决定：过度延伸过滤，双向。上一单信号价 64143.7 就是 10 小时最低点，
+    # 3/3 票 + ADX 29 全是最强看空，但跌得越狠离反弹越近——信号打在底上。
+    # 规则：做空时现价比 6 小时高点跌超 3 倍 ATR 就不追空；做多时现价比 6 小时低点
+    # 涨超 3 倍 ATR 就不追多。3 倍 ATR = 22.5（atr=7.5）。
+    check(evaluate(**base_kwargs(range_high=2070.0)) is None,
+          "A 跌多了不追空：比 6h 高点跌 30 点（>22.5）挡住")
+    check(evaluate(**base_kwargs(range_high=2050.0)) is not None,
+          "A 跌 10 点（<22.5）不挡，做空信号触发")
+    check(evaluate(**base_kwargs(range_high=2062.5)) is not None,
+          "A 正好 3 倍 ATR（22.5）不挡（只挡超过的）")
+    check(evaluate(**base_kwargs(range_high=None)) is not None,
+          "A 无 6h 高点数据时不过滤，做空信号触发")
+    long_kw = dict(price=2070.0, ma_fast=2065.0, ma_slow=2060.0, midline=2060.0)
+    check(evaluate(**base_kwargs(**long_kw, range_low=2040.0)) is None,
+          "A 涨多了不追多：比 6h 低点涨 30 点（>22.5）挡住")
+    check(evaluate(**base_kwargs(**long_kw, range_low=2060.0)) is not None,
+          "A 涨 10 点（<22.5）不挡，做多信号触发")
+    check(evaluate(**base_kwargs(**long_kw, range_low=None)) is not None,
+          "A 无 6h 低点数据时不过滤，做多信号触发")
+
+
 def test_direction_from_15m():
     # 2026-11-16 用户决定：去掉 EMA50 方向过滤，短线看 15 分钟波动选方向。
     # 做多/做空只看 15 分钟三票，不再被高周期均线挡住。
@@ -200,6 +222,7 @@ def test_constants():
 if __name__ == "__main__":
     test_votes_3of3_only()
     test_no_adx_gate()
+    test_overextension_filter()
     test_direction_from_15m()
     test_margin_400_and_max_loss()
     test_atr15_sl_tp()

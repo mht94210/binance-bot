@@ -10,6 +10,9 @@
 - 信号：实时判断（当前未收盘的 15 分钟 K 线，每 60 秒一次）；均线方向、分界线、
   量能三项必须全中（3/3 全票），多空由 15 分钟波动决定（均线/分界线/量能）；
   止盈目标 < 0.30% 不做；冷却与额度由风控器管。
+- 过度延伸过滤（2026-11-16 用户决定）：做空时现价比 6 小时高点跌超 3 倍 ATR
+  就不追空，做多时现价比 6 小时低点涨超 3 倍 ATR 就不追多——信号打在反转点
+  是因为跌得越狠信号越强，过度延伸就是衰竭。
 - 止损止盈：按 15 分钟 ATR 算。止损 2 倍 ATR，止盈 3 倍 ATR，盈亏比 1:1.5。
 - 手续费地板：止盈目标 < 0.30% 不做（手续费就把利润吃掉了）。
 - 保本和出场由 main.py 管：赚到 1 倍风险就把止损移到成本价。
@@ -18,6 +21,7 @@
 """
 from config import (
     FEE_FLOOR_PCT,
+    OVEREXTENSION_ATR_MULT,
     SL_ATR_MULT,
     TP_ATR_MULT,
 )
@@ -53,21 +57,25 @@ def evaluate(price: float, atr: float | None,
              adx15: float | None, ma_fast: float | None, ma_slow: float | None,
              midline: float | None,
              volume: float | None, volume_sma: float | None,
+             range_high: float | None = None, range_low: float | None = None,
              log=None) -> dict | None:
     """
     实时判断：每 60 秒用当前未收盘的 15 分钟 K 线调用一次。price 是判断时的实时价
     （不是那根 K 线的收盘价，避免入场价滞后）；指标（ATR/ADX/均线/分界线/量能）
     按含当前未收盘 K 线的 15 分钟 K 线算（2026-11-16 用户决定，解决进场晚）。
+    range_high / range_low 是过去 6 小时区间的最高最低价（不传则不过度延伸过滤）。
     指标缺失（预热期）时直接返回 None，不过滤也不开单。
     返回信号 dict，或 None（无信号）。信号一定带 stop_loss 和 take_profit。
     被某道闸门挡住时，如传了 log 就记一条原因，方便查为什么没开单。
 
     闸门（2026-11-16 用户决定：去掉 EMA50 方向过滤和 ADX 门槛，短线看波动选方向，
-    实时判断，多空来回做）：
+    实时判断，多空来回做；再加过度延伸过滤，治信号打在反转点）：
     1. 共振：均线方向、分界线、量能三项必须全中（3/3 全票）；多空由 15 分钟
        波动决定——做多 3/3 就做多，做空 3/3 就做空；
     2. 手续费地板：止盈目标 < 0.30% 不做；
-    3. 冷却与额度：由风控器管，不在这里判断。
+    3. 过度延伸：做空时现价比 6 小时高点跌超 3 倍 ATR 就不追空，做多时现价比
+       6 小时低点涨超 3 倍 ATR 就不追多；
+    4. 冷却与额度：由风控器管，不在这里判断。
     ADX 只作参考记进信号原因，不再设门槛。
     """
     def _blocked(reason: str):
@@ -92,6 +100,20 @@ def evaluate(price: float, atr: float | None,
 
     votes_long = _votes_long(price, ma_fast, ma_slow, midline, volume, volume_sma)
     votes_short = _votes_short(price, ma_fast, ma_slow, midline, volume, volume_sma)
+
+    # 过度延伸过滤（2026-11-16 用户决定，治信号打在反转点）：
+    # 跌得越狠信号越强，但过度延伸就是衰竭——上一单信号价 64143.7 就是 10 小时最低点。
+    if votes_short == 3 and range_high is not None:
+        drop = range_high - price
+        if drop > OVEREXTENSION_ATR_MULT * atr:
+            return _blocked(f"跌多了不追空：现价比 6 小时高点跌了 {drop:.0f} 点"
+                            f"（{drop / atr:.1f} 倍 ATR），不追空。")
+    if votes_long == 3 and range_low is not None:
+        rise = price - range_low
+        if rise > OVEREXTENSION_ATR_MULT * atr:
+            return _blocked(f"涨多了不追多：现价比 6 小时低点涨了 {rise:.0f} 点"
+                            f"（{rise / atr:.1f} 倍 ATR），不追多。")
+
     if votes_long == 3:
         return {
             "side": "LONG",

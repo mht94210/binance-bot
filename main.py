@@ -60,6 +60,7 @@ from config import (
     MAKER_RETRY_BUFFER_PCT,
     MAX_DAILY_LOSS_USDT,
     MAX_OPEN_POSITIONS,
+    RANGE_LOOKBACK_CANDLES,
     RECONCILE_RETRY_SECONDS,
     RECV_WINDOW_MS,
     SYMBOLS,
@@ -175,6 +176,10 @@ def compute_indicators(symbol: str) -> dict | None:
     # 滚动分界线：最近 4 根 15 分钟 K 线（60 分钟）最高最低价的中点，跟着市场走
     recent = k15[-4:]
     midline = (max(k["high"] for k in recent) + min(k["low"] for k in recent)) / 2
+    # 6 小时区间高低点：过度延伸过滤用（跌多了不追空、涨多了不追多）
+    range_window = k15[-RANGE_LOOKBACK_CANDLES:]
+    range_high = max(k["high"] for k in range_window)
+    range_low = min(k["low"] for k in range_window)
     return {
         "candle_open_time": k15[-1]["open_time"],
         "price": k15[-1]["close"],
@@ -185,6 +190,8 @@ def compute_indicators(symbol: str) -> dict | None:
         "midline": midline,
         "volume": k15[-1]["volume"],
         "volume_sma": sma(volumes15, VOL_SMA_PERIOD),
+        "range_high": range_high,
+        "range_low": range_low,
     }
 
 
@@ -1065,7 +1072,7 @@ def main() -> None:
     log("BTC+ETH 合约短线机器人启动（10 倍快进快出方案，2026-11-10 用户确认；2026-11-11 加 ETH）")
     log(f"标的: {', '.join(SYMBOLS)} | Dry-Run: {DRY_RUN} | 实盘开关: {LIVE_TRADING_ENABLED} | 实盘已开: {live_trading_active()}")
     log("策略: 15m 波动选方向（实时信号：当前未收盘 K 线，每 60 秒判断一次；15m 均线，3/3 全票；"
-        "多空由 15 分钟波动决定，ADX 仅参考不设门槛）+ 量能过滤；"
+        "多空由 15 分钟波动决定，ADX 仅参考不设门槛；过度延伸过滤：离 6 小时极端点超 3 倍 ATR 不追）+ 量能过滤；"
         "止损 2 倍 ATR，止盈 3 倍 ATR，盈亏比 1:1.5；赚 1 倍风险保本；"
         "进场限价单，止损市价单；冷却 15 分钟（止损后 30 分钟，3/3 强信号可跳过）；"
         "每个币种一天最多 10 单、同时最多 1 单（全账户同时最多 2 单）")
@@ -1288,6 +1295,8 @@ def main() -> None:
                               ma_fast=indicators["ma_fast"], ma_slow=indicators["ma_slow"],
                               midline=indicators["midline"],
                               volume=indicators["volume"], volume_sma=indicators["volume_sma"],
+                              range_high=indicators["range_high"],
+                              range_low=indicators["range_low"],
                               log=log if is_new_candle else None)
             if signal is None:
                 if is_new_candle:
