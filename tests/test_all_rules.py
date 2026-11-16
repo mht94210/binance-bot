@@ -1,7 +1,7 @@
 """机器人规则回归总测（放在仓库里，虚拟机重启也不丢）。
 
 覆盖用户确认过的全部规则（2026-11-11）：
-A) 少而精：3/3 全票、ADX>25、4h 趋势过滤、保证金 400U、15m 信号/ATR
+A) 少而精：3/3 全票、ADX>25、保证金 400U、15m 信号/ATR；2026-11-16 去掉 EMA50 方向过滤，短线看 15 分钟波动选方向
 B) 放宽止损：止损 2 倍 ATR、止盈 3 倍 ATR、盈亏比 1:1.5
 C) 冷却跳过：3/3 强信号跳过冷却；连亏暂停/消息禁入/每日熔断是硬刹车
 D) 熔断：日熔断 100U；state.json 丢失时收紧到 50U；UTC 午夜恢复 100U
@@ -17,7 +17,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import (
     ADX_MIN,
-    EMA_PERIOD_4H,
     FLAT_POLL_SECONDS,
     HOLDING_POLL_SECONDS,
     MAX_DAILY_LOSS_USDT,
@@ -38,7 +37,7 @@ def check(cond, label):
 
 
 def base_kwargs(**over):
-    kw = dict(price=2040.0, atr=7.5, ema50_1h=2050.0, ema50_4h=2060.0,
+    kw = dict(price=2040.0, atr=7.5,
               adx15=35.0, ma_fast=2041.0, ma_slow=2045.0, midline=2046.0,
               volume=100.0, volume_sma=80.0)
     kw.update(over)
@@ -51,12 +50,12 @@ def test_votes_3of3_only():
     check(sig is not None and sig["side"] == "SHORT" and sig["votes"] == 3,
           "A 3/3 全票做空信号触发")
     check(evaluate(**base_kwargs(volume=50.0)) is None, "A 2/3 票挡住（量能不足）")
-    check(evaluate(**base_kwargs(ma_fast=2046.0, midline=2030.0)) is None, "A 1/3 票挡住")
-    sig4 = evaluate(**base_kwargs(price=2070.0, ema50_1h=2050.0, ema50_4h=2040.0,
+    check(evaluate(**base_kwargs(ma_fast=2046.0, midline=2050.0, volume=50.0)) is None, "A 1/3 票挡住（两边都不足 3/3）")
+    sig4 = evaluate(**base_kwargs(price=2070.0,
                                   ma_fast=2065.0, ma_slow=2060.0, midline=2060.0))
     check(sig4 is not None and sig4["side"] == "LONG" and sig4["votes"] == 3,
           "A 3/3 全票做多信号触发")
-    sig5 = evaluate(**base_kwargs(price=2070.0, ema50_1h=2050.0, ema50_4h=2040.0,
+    sig5 = evaluate(**base_kwargs(price=2070.0,
                                   ma_fast=2065.0, ma_slow=2060.0, midline=2080.0))
     check(sig5 is None, "A 做多 2/3 票挡住（分界线下方）")
 
@@ -67,12 +66,18 @@ def test_adx_threshold_25():
     check(evaluate(**base_kwargs(adx15=26.0)) is not None, "A ADX 26 放行")
 
 
-def test_ema4h_filter():
-    check(evaluate(**base_kwargs(ema50_4h=2030.0)) is None, "A 1h 空、4h 多，方向不一致挡住")
-    check(evaluate(**base_kwargs(price=2070.0, ema50_1h=2050.0, ema50_4h=2080.0,
-                                 ma_fast=2065.0, ma_slow=2060.0, midline=2060.0)) is None,
-          "A 1h 多、4h 空，方向不一致挡住")
-    check(evaluate(**base_kwargs()) is not None, "A 两条线同向下方，做空放行")
+def test_direction_from_15m():
+    # 2026-11-16 用户决定：去掉 EMA50 方向过滤，短线看 15 分钟波动选方向。
+    # 做多/做空只看 15 分钟三票，不再被高周期均线挡住。
+    sig_long = evaluate(**base_kwargs(price=2070.0,
+                                      ma_fast=2065.0, ma_slow=2060.0, midline=2060.0))
+    check(sig_long is not None and sig_long["side"] == "LONG",
+          "A 15m 做多 3/3 票直接放行（无 EMA 方向限制）")
+    sig_short = evaluate(**base_kwargs())
+    check(sig_short is not None and sig_short["side"] == "SHORT",
+          "A 15m 做空 3/3 票直接放行（无 EMA 方向限制）")
+    check(evaluate(**base_kwargs(ma_fast=2046.0, midline=2050.0, volume=50.0)) is None,
+          "A 两边都不足 3/3 票时挡住")
 
 
 def test_margin_400_and_max_loss():
@@ -101,13 +106,13 @@ def test_widen_stop():
     check(SL_ATR_MULT == 2.0, f"B 止损倍数 2.0（实得 {SL_ATR_MULT}）")
     check(TP_ATR_MULT == 3.0, f"B 止盈倍数 3.0（实得 {TP_ATR_MULT}）")
     check(abs(TP_ATR_MULT / SL_ATR_MULT - 1.5) < 1e-9, "B 盈亏比仍 1:1.5")
-    sig = evaluate(price=70000.0, atr=100.0, ema50_1h=71000.0, ema50_4h=71500.0,
+    sig = evaluate(price=70000.0, atr=100.0,
                    adx15=31.0, ma_fast=69900.0, ma_slow=70100.0, midline=70200.0,
                    volume=200.0, volume_sma=100.0)
     check(sig is not None and sig["side"] == "SHORT", "B 做空信号触发")
     check(sig["stop_loss"] == 70200.0, f"B 止损 70000+200=70200（实得 {sig['stop_loss']}）")
     check(sig["take_profit_1"] == 69700.0, f"B 止盈 70000-300=69700（实得 {sig['take_profit_1']}）")
-    sig2 = evaluate(price=70000.0, atr=100.0, ema50_1h=69000.0, ema50_4h=68500.0,
+    sig2 = evaluate(price=70000.0, atr=100.0,
                     adx15=31.0, ma_fast=70100.0, ma_slow=69900.0, midline=69800.0,
                     volume=200.0, volume_sma=100.0)
     check(sig2 is not None and sig2["side"] == "LONG", "B 做多信号触发")
@@ -188,14 +193,13 @@ def test_polling_constants():
 def test_constants():
     check(ADX_MIN == 25, f"常量 ADX_MIN=25（实得 {ADX_MIN}）")
     check(MAX_MARGIN_PER_TRADE_USDT == 400.0, f"常量保证金上限 400U（实得 {MAX_MARGIN_PER_TRADE_USDT}）")
-    check(EMA_PERIOD_4H == 50, f"常量 4h EMA 周期 50（实得 {EMA_PERIOD_4H}）")  # 2026-11-15 用户决定：EMA200 改 EMA50
     check(MAX_DAILY_LOSS_USDT == 100.0, f"常量日熔断 100U（实得 {MAX_DAILY_LOSS_USDT}）")
 
 
 if __name__ == "__main__":
     test_votes_3of3_only()
     test_adx_threshold_25()
-    test_ema4h_filter()
+    test_direction_from_15m()
     test_margin_400_and_max_loss()
     test_atr15_sl_tp()
     test_widen_stop()

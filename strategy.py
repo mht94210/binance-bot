@@ -3,11 +3,12 @@
 
 版本：2026-11-10 用户确认（综合 3Commas / Cryptohopper / Pionex / Freqtrade 等做法后定）。
 2026-11-11 用户决定改成少而精：信号 15 分钟，3/3 全票，ADX>25，加 4 小时趋势过滤，保证金 400 U/单。
+2026-11-16 用户决定：去掉 EMA50 方向过滤——短线看波动选方向，不再只顺大趋势做。
+反弹本身就是机会：跌多了出现做多信号就做多吃反弹，反弹到压力位上不去再做空。
 - 信号周期：15 分钟 K 线收盘时判断；持仓管理每 5 秒轮询（止盈止损 / 保本）。
-- 五道闸门：4 小时 EMA50 和 1 小时 EMA50 同向才做（上方只做多、下方只做空，
-  两条线方向不一致不动）；15 分钟 ADX 必须 >25（没趋势不动）；
-  均线方向、分界线、量能三项必须全中（3/3 全票）；
-  止盈目标 < 0.30% 不做；冷却与额度由风控器管。
+- 闸门：15 分钟 ADX 必须 >25（没趋势不动）；均线方向、分界线、量能三项必须
+  全中（3/3 全票），多空由 15 分钟波动决定（均线/分界线/量能）；止盈目标 < 0.30% 不做；
+  冷却与额度由风控器管。
 - 止损止盈：按 15 分钟 ATR 算。止损 2 倍 ATR，止盈 3 倍 ATR，盈亏比 1:1.5。
 - 手续费地板：止盈目标 < 0.30% 不做（手续费就把利润吃掉了）。
 - 保本和出场由 main.py 管：赚到 1 倍风险就把止损移到成本价。
@@ -48,26 +49,24 @@ def _votes_short(price: float, ma_fast: float | None, ma_slow: float | None,
     return votes
 
 
-def evaluate(price: float, atr: float | None, ema50_1h: float | None,
-             ema50_4h: float | None,
+def evaluate(price: float, atr: float | None,
              adx15: float | None, ma_fast: float | None, ma_slow: float | None,
              midline: float | None,
              volume: float | None, volume_sma: float | None,
              log=None) -> dict | None:
     """
     在一根 15 分钟 K 线收盘时调用。price 是判断时的实时价（不是那根 K 线的收盘价，
-    避免入场价滞后）；指标（ATR/ADX/EMA/均线/分界线/量能）仍按已收盘 K 线算。
+    避免入场价滞后）；指标（ATR/ADX/均线/分界线/量能）仍按已收盘 K 线算。
     指标缺失（预热期）时直接返回 None，不过滤也不开单。
     返回信号 dict，或 None（无信号）。信号一定带 stop_loss 和 take_profit。
     被某道闸门挡住时，如传了 log 就记一条原因，方便查为什么没开单。
 
-    五道闸门：
-    1. 方向：4 小时 EMA50 和 1 小时 EMA50 同向才做（上方只做多、下方只做空，
-       两条线方向不一致不动）；
-    2. 强度：15 分钟 ADX 必须 >25，否则说明没趋势；
-    3. 共振：均线方向、分界线、量能三项必须全中（3/3 全票）；
-    4. 手续费地板：止盈目标 < 0.30% 不做；
-    5. 冷却与额度：由风控器管，不在这里判断。
+    闸门（2026-11-16 用户决定：去掉 EMA50 方向过滤，短线看波动选方向）：
+    1. 强度：15 分钟 ADX 必须 >25，否则说明没趋势；
+    2. 共振：均线方向、分界线、量能三项必须全中（3/3 全票）；多空由 15 分钟
+       波动决定——做多 3/3 就做多，做空 3/3 就做空；
+    3. 手续费地板：止盈目标 < 0.30% 不做；
+    4. 冷却与额度：由风控器管，不在这里判断。
     """
     def _blocked(reason: str):
         if log is not None:
@@ -76,10 +75,6 @@ def evaluate(price: float, atr: float | None, ema50_1h: float | None,
 
     if atr is None or atr <= 0:
         return _blocked("ATR 还没算出来（15 分钟 K 线不够 15 根），等预热。")
-    if ema50_1h is None:
-        return _blocked("1 小时 EMA50 还没算出来（1 小时 K 线不够 200 根），等预热。")
-    if ema50_4h is None:
-        return _blocked("4 小时 EMA50 还没算出来（4 小时 K 线不够 200 根），等预热。")
     if adx15 is None:
         return _blocked("15 分钟 ADX 还没算出来，等预热。")
     if ma_fast is None or ma_slow is None:
@@ -95,10 +90,9 @@ def evaluate(price: float, atr: float | None, ema50_1h: float | None,
     stop_distance = SL_ATR_MULT * atr
     take_distance = TP_ATR_MULT * atr
 
-    if price > ema50_1h and price > ema50_4h:
-        votes = _votes_long(price, ma_fast, ma_slow, midline, volume, volume_sma)
-        if votes < 3:
-            return _blocked(f"做多共振不足：{votes}/3 票（均线/分界线/量能），要 3 票全中。")
+    votes_long = _votes_long(price, ma_fast, ma_slow, midline, volume, volume_sma)
+    votes_short = _votes_short(price, ma_fast, ma_slow, midline, volume, volume_sma)
+    if votes_long == 3:
         return {
             "side": "LONG",
             "entry": price,
@@ -107,15 +101,12 @@ def evaluate(price: float, atr: float | None, ema50_1h: float | None,
             "take_profit_1": price + take_distance,
             "take_profit_2": None,
             "atr": atr,
-            "votes": votes,
-            "reason": f"15m 共振做多 {votes}/3 票（4h+1h EMA50 上方/ADX {adx15:.0f}/均线多头），"
+            "votes": votes_long,
+            "reason": f"15m 波动做多 {votes_long}/3 票（ADX {adx15:.0f}/均线多头），"
                       f"止损 {stop_distance:.0f} 点，止盈 {take_distance:.0f} 点",
             "mode": "scalp10x",
         }
-    if price < ema50_1h and price < ema50_4h:
-        votes = _votes_short(price, ma_fast, ma_slow, midline, volume, volume_sma)
-        if votes < 3:
-            return _blocked(f"做空共振不足：{votes}/3 票（均线/分界线/量能），要 3 票全中。")
+    if votes_short == 3:
         return {
             "side": "SHORT",
             "entry": price,
@@ -124,9 +115,9 @@ def evaluate(price: float, atr: float | None, ema50_1h: float | None,
             "take_profit_1": price - take_distance,
             "take_profit_2": None,
             "atr": atr,
-            "votes": votes,
-            "reason": f"15m 共振做空 {votes}/3 票（4h+1h EMA50 下方/ADX {adx15:.0f}/均线空头），"
+            "votes": votes_short,
+            "reason": f"15m 波动做空 {votes_short}/3 票（ADX {adx15:.0f}/均线空头），"
                       f"止损 {stop_distance:.0f} 点，止盈 {take_distance:.0f} 点",
             "mode": "scalp10x",
         }
-    return _blocked("4 小时和 1 小时 EMA50 方向不一致（或现价压在 EMA50 上），只顺大方向做，不动。")
+    return _blocked(f"共振不足：做多 {votes_long}/3 票、做空 {votes_short}/3 票（均线/分界线/量能），要 3 票全中。")
