@@ -1,7 +1,7 @@
 """机器人规则回归总测（放在仓库里，虚拟机重启也不丢）。
 
 覆盖用户确认过的全部规则（2026-11-11）：
-A) 少而精：3/3 全票、ADX>30、4h 趋势过滤、保证金 400U、15m 信号/ATR
+A) 少而精：3/3 全票、ADX>25、4h 趋势过滤、保证金 400U、15m 信号/ATR
 B) 放宽止损：止损 2 倍 ATR、止盈 3 倍 ATR、盈亏比 1:1.5
 C) 冷却跳过：3/3 强信号跳过冷却；连亏暂停/消息禁入/每日熔断是硬刹车
 D) 熔断：日熔断 100U；state.json 丢失时收紧到 50U；UTC 午夜恢复 100U
@@ -61,10 +61,10 @@ def test_votes_3of3_only():
     check(sig5 is None, "A 做多 2/3 票挡住（分界线下方）")
 
 
-def test_adx_threshold_30():
-    check(evaluate(**base_kwargs(adx15=25.0)) is None, "A ADX 25 挡住")
-    check(evaluate(**base_kwargs(adx15=30.0)) is None, "A ADX 30 挡住（<=30 不算趋势）")
-    check(evaluate(**base_kwargs(adx15=31.0)) is not None, "A ADX 31 放行")
+def test_adx_threshold_25():
+    check(evaluate(**base_kwargs(adx15=20.0)) is None, "A ADX 20 挡住")
+    check(evaluate(**base_kwargs(adx15=25.0)) is None, "A ADX 25 挡住（<=25 不算趋势）")
+    check(evaluate(**base_kwargs(adx15=26.0)) is not None, "A ADX 26 放行")
 
 
 def test_ema4h_filter():
@@ -186,7 +186,7 @@ def test_polling_constants():
 
 
 def test_constants():
-    check(ADX_MIN == 30, f"常量 ADX_MIN=30（实得 {ADX_MIN}）")
+    check(ADX_MIN == 25, f"常量 ADX_MIN=25（实得 {ADX_MIN}）")
     check(MAX_MARGIN_PER_TRADE_USDT == 400.0, f"常量保证金上限 400U（实得 {MAX_MARGIN_PER_TRADE_USDT}）")
     check(EMA_PERIOD_4H == 50, f"常量 4h EMA 周期 50（实得 {EMA_PERIOD_4H}）")  # 2026-11-15 用户决定：EMA200 改 EMA50
     check(MAX_DAILY_LOSS_USDT == 100.0, f"常量日熔断 100U（实得 {MAX_DAILY_LOSS_USDT}）")
@@ -194,7 +194,7 @@ def test_constants():
 
 if __name__ == "__main__":
     test_votes_3of3_only()
-    test_adx_threshold_30()
+    test_adx_threshold_25()
     test_ema4h_filter()
     test_margin_400_and_max_loss()
     test_atr15_sl_tp()
