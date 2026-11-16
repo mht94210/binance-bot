@@ -157,30 +157,33 @@ def get_klines(symbol: str, interval: str, limit: int) -> list[dict]:
 
 def compute_indicators(symbol: str) -> dict | None:
     """拉 15 分钟 K 线，算出信号要用的全部指标。失败返回 None。
-    只用已收盘的 K 线（去掉最后一根未收盘的）。
+    实时信号：用当前未收盘的 K 线判断（不再等收盘），每 60 秒判断一次
+    （2026-11-16 用户决定，解决进场晚：原来只用收盘 K 线，每根只判断一次，
+    行情走完才看到信号）。
     信号周期 15 分钟（2026-11-11 用户决定少而精：5 分钟噪音太多）；
-    2026-11-16 用户决定去掉 EMA50 方向过滤，短线看 15 分钟波动选方向。"""
+    2026-11-16 用户决定去掉 EMA50 方向过滤和 ADX 门槛，短线看 15 分钟波动选方向，
+    多空来回做。
+    """
     k15 = get_klines(symbol, "15m", 40)
     if len(k15) < ATR_PERIOD + 2 or len(k15) < ADX_PERIOD * 2 + 1:
         log(f"{symbol} K 线不够，指标算不出来，等下一根 15 分钟 K 线。")
         return None
-    closed15 = k15[:-1]
-    closes15 = [k["close"] for k in closed15]
-    volumes15 = [k["volume"] for k in closed15]
-    atr_value = atr(closed15, ATR_PERIOD)
-    adx_value, _, _ = adx(closed15, ADX_PERIOD)
+    closes15 = [k["close"] for k in k15]
+    volumes15 = [k["volume"] for k in k15]
+    atr_value = atr(k15, ATR_PERIOD)
+    adx_value, _, _ = adx(k15, ADX_PERIOD)
     # 滚动分界线：最近 4 根 15 分钟 K 线（60 分钟）最高最低价的中点，跟着市场走
-    recent = closed15[-4:]
+    recent = k15[-4:]
     midline = (max(k["high"] for k in recent) + min(k["low"] for k in recent)) / 2
     return {
-        "candle_open_time": closed15[-1]["open_time"],
-        "price": closed15[-1]["close"],
+        "candle_open_time": k15[-1]["open_time"],
+        "price": k15[-1]["close"],
         "atr": atr_value,
         "adx15": adx_value,
         "ma_fast": sma(closes15, MA_FAST_PERIOD),
         "ma_slow": sma(closes15, MA_SLOW_PERIOD),
         "midline": midline,
-        "volume": closed15[-1]["volume"],
+        "volume": k15[-1]["volume"],
         "volume_sma": sma(volumes15, VOL_SMA_PERIOD),
     }
 
@@ -1061,7 +1064,8 @@ def main() -> None:
     log("=" * 60)
     log("BTC+ETH 合约短线机器人启动（10 倍快进快出方案，2026-11-10 用户确认；2026-11-11 加 ETH）")
     log(f"标的: {', '.join(SYMBOLS)} | Dry-Run: {DRY_RUN} | 实盘开关: {LIVE_TRADING_ENABLED} | 实盘已开: {live_trading_active()}")
-    log("策略: 15m 波动选方向（15m ADX>25 + 15m 均线，3/3 全票；多空由 15 分钟波动决定）+ 量能过滤；"
+    log("策略: 15m 波动选方向（实时信号：当前未收盘 K 线，每 60 秒判断一次；15m 均线，3/3 全票；"
+        "多空由 15 分钟波动决定，ADX 仅参考不设门槛）+ 量能过滤；"
         "止损 2 倍 ATR，止盈 3 倍 ATR，盈亏比 1:1.5；赚 1 倍风险保本；"
         "进场限价单，止损市价单；冷却 15 分钟（止损后 30 分钟，3/3 强信号可跳过）；"
         "每个币种一天最多 10 单、同时最多 1 单（全账户同时最多 2 单）")
@@ -1264,7 +1268,9 @@ def main() -> None:
                         f"保本{'已移' if position['breakeven_done'] else '未触发'}。")
                 continue
 
-            # ---------- 无持仓：等 15 分钟 K 线收盘再判断 ----------
+            # ---------- 无持仓：实时判断，不等 15 分钟 K 线收盘 ----------
+            # 实时信号（2026-11-16 用户决定，解决进场晚）：同一根未收盘 K 线每 60 秒
+            # 重新判断一次；没信号时只在新 K 线才记日志，免得刷屏。
             # 持仓时主循环 5 秒一轮，空仓币种不能每 5 秒拉 3 组 K 线：60 秒最多判断一次。
             if now - last_flat_eval[symbol] < 55:
                 continue
@@ -1272,10 +1278,7 @@ def main() -> None:
             indicators = compute_indicators(symbol)
             if indicators is None:
                 continue
-            if indicators["candle_open_time"] == last_eval_candle[symbol]:
-                # 这根 15 分钟 K 线已经判断过，等下一根
-                log(f"无信号，{symbol} 现价 {price:.1f}，继续等 1 分钟。")
-                continue
+            is_new_candle = indicators["candle_open_time"] != last_eval_candle[symbol]
             last_eval_candle[symbol] = indicators["candle_open_time"]
 
             # 入场按判断时的实时价，不用滞后的 5 分钟 K 线收盘价（2026-11-10 的教训：
@@ -1285,9 +1288,10 @@ def main() -> None:
                               ma_fast=indicators["ma_fast"], ma_slow=indicators["ma_slow"],
                               midline=indicators["midline"],
                               volume=indicators["volume"], volume_sma=indicators["volume_sma"],
-                              log=log)
+                              log=log if is_new_candle else None)
             if signal is None:
-                log(f"无信号，{symbol} 现价 {price:.1f}（15m 收 {indicators['price']:.1f}），继续等。")
+                if is_new_candle:
+                    log(f"无信号，{symbol} 现价 {price:.1f}（15m 收 {indicators['price']:.1f}），继续等。")
                 continue
 
             signal["symbol"] = symbol

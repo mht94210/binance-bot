@@ -1,7 +1,8 @@
 """机器人规则回归总测（放在仓库里，虚拟机重启也不丢）。
 
 覆盖用户确认过的全部规则（2026-11-11）：
-A) 少而精：3/3 全票、ADX>25、保证金 400U、15m 信号/ATR；2026-11-16 去掉 EMA50 方向过滤，短线看 15 分钟波动选方向
+A) 少而精：3/3 全票、保证金 400U、15m 信号/ATR；2026-11-16 去掉 EMA50 方向过滤，短线看 15 分钟波动选方向；
+   2026-11-16 再去掉 ADX 门槛 + 实时信号（当前未收盘 K 线，每 60 秒判断一次），解决进场晚
 B) 放宽止损：止损 2 倍 ATR、止盈 3 倍 ATR、盈亏比 1:1.5
 C) 冷却跳过：3/3 强信号跳过冷却；连亏暂停/消息禁入/每日熔断是硬刹车
 D) 熔断：日熔断 100U；state.json 丢失时收紧到 50U；UTC 午夜恢复 100U
@@ -16,7 +17,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import (
-    ADX_MIN,
     FLAT_POLL_SECONDS,
     HOLDING_POLL_SECONDS,
     MAX_DAILY_LOSS_USDT,
@@ -60,10 +60,12 @@ def test_votes_3of3_only():
     check(sig5 is None, "A 做多 2/3 票挡住（分界线下方）")
 
 
-def test_adx_threshold_25():
-    check(evaluate(**base_kwargs(adx15=20.0)) is None, "A ADX 20 挡住")
-    check(evaluate(**base_kwargs(adx15=25.0)) is None, "A ADX 25 挡住（<=25 不算趋势）")
-    check(evaluate(**base_kwargs(adx15=26.0)) is not None, "A ADX 26 放行")
+def test_no_adx_gate():
+    # 2026-11-16 用户决定：去掉 ADX 门槛（解决进场晚：ADX 是最慢的确认，等它上 25 行情已走完）。
+    # ADX 只作参考记进信号原因，低 ADX 下 3/3 票照样开单；ADX 缺失（预热期）仍挡住。
+    check(evaluate(**base_kwargs(adx15=10.0)) is not None, "A ADX 10 不挡 3/3 票")
+    check(evaluate(**base_kwargs(adx15=5.0)) is not None, "A ADX 5 不挡 3/3 票")
+    check(evaluate(**base_kwargs(adx15=None)) is None, "A ADX 缺失仍挡住（预热期）")
 
 
 def test_direction_from_15m():
@@ -191,14 +193,13 @@ def test_polling_constants():
 
 
 def test_constants():
-    check(ADX_MIN == 25, f"常量 ADX_MIN=25（实得 {ADX_MIN}）")
     check(MAX_MARGIN_PER_TRADE_USDT == 400.0, f"常量保证金上限 400U（实得 {MAX_MARGIN_PER_TRADE_USDT}）")
     check(MAX_DAILY_LOSS_USDT == 100.0, f"常量日熔断 100U（实得 {MAX_DAILY_LOSS_USDT}）")
 
 
 if __name__ == "__main__":
     test_votes_3of3_only()
-    test_adx_threshold_25()
+    test_no_adx_gate()
     test_direction_from_15m()
     test_margin_400_and_max_loss()
     test_atr15_sl_tp()

@@ -5,10 +5,11 @@
 2026-11-11 用户决定改成少而精：信号 15 分钟，3/3 全票，ADX>25，加 4 小时趋势过滤，保证金 400 U/单。
 2026-11-16 用户决定：去掉 EMA50 方向过滤——短线看波动选方向，不再只顺大趋势做。
 反弹本身就是机会：跌多了出现做多信号就做多吃反弹，反弹到压力位上不去再做空。
-- 信号周期：15 分钟 K 线收盘时判断；持仓管理每 5 秒轮询（止盈止损 / 保本）。
-- 闸门：15 分钟 ADX 必须 >25（没趋势不动）；均线方向、分界线、量能三项必须
-  全中（3/3 全票），多空由 15 分钟波动决定（均线/分界线/量能）；止盈目标 < 0.30% 不做；
-  冷却与额度由风控器管。
+2026-11-16 用户决定（解决进场晚）：去掉 ADX 门槛 + 实时信号——不再等 15 分钟 K 线
+收盘，每 60 秒用当前未收盘的 K 线判断一次，3/3 票就进，多空来回做。
+- 信号：实时判断（当前未收盘的 15 分钟 K 线，每 60 秒一次）；均线方向、分界线、
+  量能三项必须全中（3/3 全票），多空由 15 分钟波动决定（均线/分界线/量能）；
+  止盈目标 < 0.30% 不做；冷却与额度由风控器管。
 - 止损止盈：按 15 分钟 ATR 算。止损 2 倍 ATR，止盈 3 倍 ATR，盈亏比 1:1.5。
 - 手续费地板：止盈目标 < 0.30% 不做（手续费就把利润吃掉了）。
 - 保本和出场由 main.py 管：赚到 1 倍风险就把止损移到成本价。
@@ -16,7 +17,6 @@
 入场按 Post Only 限价单（maker 手续费），止损按市价单；Dry-Run 下按信号价成交。
 """
 from config import (
-    ADX_MIN,
     FEE_FLOOR_PCT,
     SL_ATR_MULT,
     TP_ATR_MULT,
@@ -55,18 +55,20 @@ def evaluate(price: float, atr: float | None,
              volume: float | None, volume_sma: float | None,
              log=None) -> dict | None:
     """
-    在一根 15 分钟 K 线收盘时调用。price 是判断时的实时价（不是那根 K 线的收盘价，
-    避免入场价滞后）；指标（ATR/ADX/均线/分界线/量能）仍按已收盘 K 线算。
+    实时判断：每 60 秒用当前未收盘的 15 分钟 K 线调用一次。price 是判断时的实时价
+    （不是那根 K 线的收盘价，避免入场价滞后）；指标（ATR/ADX/均线/分界线/量能）
+    按含当前未收盘 K 线的 15 分钟 K 线算（2026-11-16 用户决定，解决进场晚）。
     指标缺失（预热期）时直接返回 None，不过滤也不开单。
     返回信号 dict，或 None（无信号）。信号一定带 stop_loss 和 take_profit。
     被某道闸门挡住时，如传了 log 就记一条原因，方便查为什么没开单。
 
-    闸门（2026-11-16 用户决定：去掉 EMA50 方向过滤，短线看波动选方向）：
-    1. 强度：15 分钟 ADX 必须 >25，否则说明没趋势；
-    2. 共振：均线方向、分界线、量能三项必须全中（3/3 全票）；多空由 15 分钟
+    闸门（2026-11-16 用户决定：去掉 EMA50 方向过滤和 ADX 门槛，短线看波动选方向，
+    实时判断，多空来回做）：
+    1. 共振：均线方向、分界线、量能三项必须全中（3/3 全票）；多空由 15 分钟
        波动决定——做多 3/3 就做多，做空 3/3 就做空；
-    3. 手续费地板：止盈目标 < 0.30% 不做；
-    4. 冷却与额度：由风控器管，不在这里判断。
+    2. 手续费地板：止盈目标 < 0.30% 不做；
+    3. 冷却与额度：由风控器管，不在这里判断。
+    ADX 只作参考记进信号原因，不再设门槛。
     """
     def _blocked(reason: str):
         if log is not None:
@@ -79,8 +81,6 @@ def evaluate(price: float, atr: float | None,
         return _blocked("15 分钟 ADX 还没算出来，等预热。")
     if ma_fast is None or ma_slow is None:
         return _blocked("15 分钟均线还没算出来，等预热。")
-    if adx15 <= ADX_MIN:
-        return _blocked(f"没趋势：15 分钟 ADX {adx15:.0f} <= {ADX_MIN}，震荡市不动。")
 
     # 手续费地板：止盈目标 < 0.30% 不做
     tp_pct = TP_ATR_MULT * atr / price
@@ -102,7 +102,7 @@ def evaluate(price: float, atr: float | None,
             "take_profit_2": None,
             "atr": atr,
             "votes": votes_long,
-            "reason": f"15m 波动做多 {votes_long}/3 票（ADX {adx15:.0f}/均线多头），"
+            "reason": f"15m 波动做多 {votes_long}/3 票（均线多头，ADX {adx15:.0f} 仅参考），"
                       f"止损 {stop_distance:.0f} 点，止盈 {take_distance:.0f} 点",
             "mode": "scalp10x",
         }
@@ -116,7 +116,7 @@ def evaluate(price: float, atr: float | None,
             "take_profit_2": None,
             "atr": atr,
             "votes": votes_short,
-            "reason": f"15m 波动做空 {votes_short}/3 票（ADX {adx15:.0f}/均线空头），"
+            "reason": f"15m 波动做空 {votes_short}/3 票（均线空头，ADX {adx15:.0f} 仅参考），"
                       f"止损 {stop_distance:.0f} 点，止盈 {take_distance:.0f} 点",
             "mode": "scalp10x",
         }
