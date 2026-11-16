@@ -2,7 +2,9 @@
 
 覆盖用户确认过的全部规则（2026-11-11）：
 A) 少而精：3/3 全票、保证金 400U、15m 信号/ATR；2026-11-16 去掉 EMA50 方向过滤，短线看 15 分钟波动选方向；
-   2026-11-16 再去掉 ADX 门槛 + 实时信号（当前未收盘 K 线，每 60 秒判断一次），解决进场晚
+   2026-11-16 再去掉 ADX 门槛 + 实时信号（当前未收盘 K 线，每 60 秒判断一次），解决进场晚；
+   2026-11-16 再加三模式（保留全部策略，按 1h ADX 智能调配：>=25 trend 原 6 胜策略，15~25 momentum，
+   <15 range 反转）+ 过度延伸过滤（跌多了不追空、涨多了不追多）
 B) 放宽止损：止损 2 倍 ATR、止盈 3 倍 ATR、盈亏比 1:1.5
 C) 冷却跳过：3/3 强信号跳过冷却；连亏暂停/消息禁入/每日熔断是硬刹车
 D) 熔断：日熔断 100U；state.json 丢失时收紧到 50U；UTC 午夜恢复 100U
@@ -25,7 +27,7 @@ from config import (
     TP_ATR_MULT,
 )
 from risk import RiskManager
-from strategy import evaluate
+from strategy import evaluate, select_mode
 
 FAILURES = []
 
@@ -88,6 +90,57 @@ def test_overextension_filter():
           "A 涨 10 点（<22.5）不挡，做多信号触发")
     check(evaluate(**base_kwargs(**long_kw, range_low=None)) is not None,
           "A 无 6h 低点数据时不过滤，做多信号触发")
+
+
+def test_select_mode():
+    # 2026-11-16 用户决定：按 1h ADX 选模式。>=25 强趋势 trend，15~25 过渡 momentum，<15 震荡 range。
+    check(select_mode(30.0) == "trend", "模式 1h ADX 30 -> trend")
+    check(select_mode(25.0) == "trend", "模式 1h ADX 25（边界）-> trend")
+    check(select_mode(20.0) == "momentum", "模式 1h ADX 20 -> momentum")
+    check(select_mode(15.0) == "momentum", "模式 1h ADX 15（边界）-> momentum")
+    check(select_mode(10.0) == "range", "模式 1h ADX 10 -> range")
+    check(select_mode(None) == "momentum", "模式 1h ADX 拿不到 -> 默认 momentum")
+
+
+def test_trend_mode():
+    # 2026-11-16 用户决定：trend 模式 = 原 6 胜策略思路（EMA50 方向过滤 + 15m ADX>25 + 3/3 票）。
+    # 过度延伸过滤不适用（大趋势就是要追）。
+    check(evaluate(**base_kwargs(mode="trend", ema_trend=2050.0, range_high=2070.0)) is not None,
+          "趋势 做空 3/3 + 现价在 EMA50 下方 + ADX 35>25 触发（跌 30 点也不被过度延伸挡）")
+    sig = evaluate(**base_kwargs(mode="trend", ema_trend=2050.0))
+    check(sig is not None and sig["side"] == "SHORT" and sig["mode"] == "trend",
+          "趋势 做空信号 mode 字段是 trend")
+    check(evaluate(**base_kwargs(mode="trend", ema_trend=2030.0)) is None,
+          "趋势 做空 3/3 但现价在 EMA50 上方（逆势）挡住")
+    check(evaluate(**base_kwargs(mode="trend", ema_trend=2050.0, adx15=20.0)) is None,
+          "趋势 15m ADX 20 不到 25 挡住")
+    check(evaluate(**base_kwargs(mode="trend", ema_trend=None)) is None,
+          "趋势 EMA50 没算出来挡住")
+    long_kw = dict(price=2070.0, ma_fast=2065.0, ma_slow=2060.0, midline=2060.0)
+    check(evaluate(**base_kwargs(**long_kw, mode="trend", ema_trend=2060.0)) is not None,
+          "趋势 做多 3/3 + 现价在 EMA50 上方 + ADX 35>25 触发")
+    check(evaluate(**base_kwargs(**long_kw, mode="trend", ema_trend=2080.0)) is None,
+          "趋势 做多 3/3 但现价在 EMA50 下方（逆势）挡住")
+
+
+def test_range_mode():
+    # 2026-11-16 用户决定：range 模式 = 反转策略（3/3 票 + 只在 6h 区间下 1/4 做多、上 1/4 做空）。
+    # 区间 2030~2070，下 1/4 <= 2040，上 1/4 >= 2060；3 倍 ATR = 22.5。
+    rng = dict(range_high=2070.0, range_low=2030.0)
+    long_kw = dict(price=2035.0, ma_fast=2045.0, ma_slow=2041.0, midline=2030.0)
+    check(evaluate(**base_kwargs(**long_kw, mode="range", **rng)) is not None,
+          "反转 做多 3/3 + 现价在区间下 1/4（2035）触发")
+    check(evaluate(**base_kwargs(price=2050.0, ma_fast=2055.0, ma_slow=2051.0, midline=2040.0,
+                                mode="range", **rng)) is None,
+          "反转 做多 3/3 但现价在区间中间（2050）挡住")
+    short_kw = dict(price=2065.0, ma_fast=2060.0, ma_slow=2065.0, midline=2070.0)
+    check(evaluate(**base_kwargs(**short_kw, mode="range", **rng)) is not None,
+          "反转 做空 3/3 + 现价在区间上 1/4（2065）触发")
+    check(evaluate(**base_kwargs(price=2050.0, ma_fast=2045.0, ma_slow=2050.0, midline=2055.0,
+                                mode="range", **rng)) is None,
+          "反转 做空 3/3 但现价在区间中间（2050）挡住")
+    check(evaluate(**base_kwargs(**long_kw, mode="range")) is None,
+          "反转 没有 6h 区间数据挡住")
 
 
 def test_direction_from_15m():
@@ -223,6 +276,9 @@ if __name__ == "__main__":
     test_votes_3of3_only()
     test_no_adx_gate()
     test_overextension_filter()
+    test_select_mode()
+    test_trend_mode()
+    test_range_mode()
     test_direction_from_15m()
     test_margin_400_and_max_loss()
     test_atr15_sl_tp()

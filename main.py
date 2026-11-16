@@ -20,7 +20,12 @@ Binance BTC+ETH 永续合约短线机器人 —— 10 倍快进快出方案（�
 
 策略（写死在 config.py）：
 - 10 倍杠杆，一单最多 400 U 保证金，名义仓位 4000 U
-- 信号：15 分钟 K 线收盘时判断（15 分钟 ADX>25 + 15 分钟均线，3/3 全票；多空由 15 分钟波动决定）
+- 三模式按 1 小时 ADX 智能调配（2026-11-16 用户决定，保留全部策略）：>=25 强趋势用 trend
+  （原 6 胜策略：EMA50 方向过滤 + 15m ADX>25 + 3/3 票）；15~25 过渡用 momentum（实时信号，
+  15m 均线 3/3 全票，多空由 15 分钟波动决定，ADX 仅参考）；<15 震荡用 range（反转：3/3 票 +
+  只在 6 小时区间下 1/4 做多、上 1/4 做空）；momentum/range 有过度延伸过滤（离 6 小时极端点
+  超 3 倍 ATR 不追），trend 模式不适用
+- 信号：15 分钟 K 线实时判断（当前未收盘 K 线，每 60 秒一次），3/3 全票
 - 止损 2 倍 ATR，止盈 3 倍 ATR，盈亏比 1:1.5；止盈目标 < 0.30% 不做
 - 赚到 1 倍风险就把止损移到成本价（保本）；进场限价单，止损市价单
 - 冷却 15 分钟，止损后 30 分钟；每个币种每天最多 10 单、同时最多 1 单
@@ -47,6 +52,7 @@ from config import (
     CONSERVATIVE_DAILY_LOSS_USDT,
     DATA_BASE_URL,
     DRY_RUN,
+    EMA_TREND_PERIOD,
     ENTRY_FILL_TIMEOUT_SECONDS,
     ENTRY_POLL_SECONDS,
     FLAT_POLL_SECONDS,
@@ -70,9 +76,9 @@ from config import (
     live_trading_missing,
     load_api_credentials,
 )
-from indicators import adx, atr, sma
+from indicators import adx, atr, ema, sma
 from risk import RiskManager
-from strategy import evaluate
+from strategy import evaluate, select_mode
 
 
 # --- Health endpoint (runs in background thread; port from $PORT, default 3000) ---
@@ -165,7 +171,7 @@ def compute_indicators(symbol: str) -> dict | None:
     2026-11-16 用户决定去掉 EMA50 方向过滤和 ADX 门槛，短线看 15 分钟波动选方向，
     多空来回做。
     """
-    k15 = get_klines(symbol, "15m", 40)
+    k15 = get_klines(symbol, "15m", 60)
     if len(k15) < ATR_PERIOD + 2 or len(k15) < ADX_PERIOD * 2 + 1:
         log(f"{symbol} K 线不够，指标算不出来，等下一根 15 分钟 K 线。")
         return None
@@ -173,6 +179,13 @@ def compute_indicators(symbol: str) -> dict | None:
     volumes15 = [k["volume"] for k in k15]
     atr_value = atr(k15, ATR_PERIOD)
     adx_value, _, _ = adx(k15, ADX_PERIOD)
+    # 大趋势（1 小时 ADX）决定策略模式：保留全部策略，按大趋势智能调配
+    # （2026-11-16 用户决定）。1h K 线拿不到时 adx1h 为 None，模式默认 momentum。
+    k1h = get_klines(symbol, "1h", 40)
+    adx1h_value, _, _ = adx(k1h, ADX_PERIOD) if len(k1h) >= ADX_PERIOD + 1 else (None, None, None)
+    mode = select_mode(adx1h_value)
+    # trend 模式的方向过滤均线（15 分钟 EMA50）
+    ema_trend_value = ema(closes15, EMA_TREND_PERIOD)
     # 滚动分界线：最近 4 根 15 分钟 K 线（60 分钟）最高最低价的中点，跟着市场走
     recent = k15[-4:]
     midline = (max(k["high"] for k in recent) + min(k["low"] for k in recent)) / 2
@@ -192,6 +205,9 @@ def compute_indicators(symbol: str) -> dict | None:
         "volume_sma": sma(volumes15, VOL_SMA_PERIOD),
         "range_high": range_high,
         "range_low": range_low,
+        "adx1h": adx1h_value,
+        "mode": mode,
+        "ema_trend": ema_trend_value,
     }
 
 
@@ -1071,8 +1087,10 @@ def main() -> None:
     log("=" * 60)
     log("BTC+ETH 合约短线机器人启动（10 倍快进快出方案，2026-11-10 用户确认；2026-11-11 加 ETH）")
     log(f"标的: {', '.join(SYMBOLS)} | Dry-Run: {DRY_RUN} | 实盘开关: {LIVE_TRADING_ENABLED} | 实盘已开: {live_trading_active()}")
-    log("策略: 15m 波动选方向（实时信号：当前未收盘 K 线，每 60 秒判断一次；15m 均线，3/3 全票；"
-        "多空由 15 分钟波动决定，ADX 仅参考不设门槛；过度延伸过滤：离 6 小时极端点超 3 倍 ATR 不追）+ 量能过滤；"
+    log("策略: 三模式按 1 小时 ADX 智能调配（>=25 强趋势用 trend 原 6 胜策略：EMA50 方向过滤 + 15m ADX>25；"
+        "15~25 过渡用 momentum 动量策略：实时信号，15m 均线 3/3 全票，多空由 15 分钟波动决定，ADX 仅参考；"
+        "<15 震荡用 range 反转策略：3/3 票 + 只在 6 小时区间下 1/4 做多、上 1/4 做空；"
+        "momentum/range 有过度延伸过滤：离 6 小时极端点超 3 倍 ATR 不追）+ 量能过滤；"
         "止损 2 倍 ATR，止盈 3 倍 ATR，盈亏比 1:1.5；赚 1 倍风险保本；"
         "进场限价单，止损市价单；冷却 15 分钟（止损后 30 分钟，3/3 强信号可跳过）；"
         "每个币种一天最多 10 单、同时最多 1 单（全账户同时最多 2 单）")
@@ -1297,6 +1315,8 @@ def main() -> None:
                               volume=indicators["volume"], volume_sma=indicators["volume_sma"],
                               range_high=indicators["range_high"],
                               range_low=indicators["range_low"],
+                              mode=indicators["mode"],
+                              ema_trend=indicators["ema_trend"],
                               log=log if is_new_candle else None)
             if signal is None:
                 if is_new_candle:

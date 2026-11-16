@@ -77,6 +77,17 @@ BREAKEVEN_AT_R = 1.0         # 赚到 1 倍风险就把止损移到成本价（�
 OVEREXTENSION_ATR_MULT = 3.0  # 过度延伸阈值：离 6 小时极端点超过 3 倍 ATR 就不追
 RANGE_LOOKBACK_CANDLES = 24    # 6 小时区间 = 24 根 15 分钟 K 线
 
+# ---------- 策略模式（2026-11-16 用户决定：保留全部策略，按大趋势智能调配）----------
+# 三种模式共用风控（止损止盈 2x/3x ATR、保本、冷却、额度），只换开单规则。
+# 模式由 1 小时 ADX（大趋势强度）决定：>=25 强趋势用 trend（原 6 胜策略思路，
+# 前两天大跌时能用上），15~25 过渡用 momentum（当前动量策略），<15 震荡用 range
+# （反转策略）。2026-11-16 晚 BTC/ETH 的 1h ADX 只有 5.0/10.6，都是 range。
+REGIME_ADX_TREND = 25.0   # 1h ADX >= 25：强趋势 -> trend 模式
+REGIME_ADX_RANGE = 15.0   # 1h ADX < 15：震荡 -> range 模式；15~25 之间 -> momentum 模式
+EMA_TREND_PERIOD = 50     # trend 模式的方向过滤均线（15 分钟 EMA50；用户 2026-11-15 嫌 EMA200 太慢改成 50）
+TREND_ADX_MIN = 25.0      # trend 模式的 ADX 门槛（15 分钟 ADX > 25 才做；用户 2026-11-16 从 30 降到 25）
+RANGE_EDGE_FRACTION = 0.25  # range 模式：只在 6 小时区间的下 1/4 做多、上 1/4 做空
+
 # ---------- 轮询间隔（2026-11-11 修止损滑点：20 秒太长，价格尖峰会穿过去）----------
 HOLDING_POLL_SECONDS = 5    # 有持仓时每 5 秒查一次止盈/止损/保本
 FLAT_POLL_SECONDS = 60      # 空仓时每 60 秒判断一次信号
