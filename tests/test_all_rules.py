@@ -5,7 +5,9 @@ A) 少而精：3/3 全票、保证金 400U、15m 信号/ATR；2026-11-16 去掉 
    2026-11-16 再去掉 ADX 门槛 + 实时信号（当前未收盘 K 线，每 60 秒判断一次），解决进场晚；
    2026-11-16 再加三模式（保留全部策略，按 1h ADX 智能调配：>=25 trend 原 6 胜策略，15~25 momentum，
    <15 range 反转）+ 过度延伸过滤（跌多了不追空、涨多了不追多）
-B) 放宽止损：止损 2 倍 ATR、止盈 3 倍 ATR、盈亏比 1:1.5
+   2026-11-17 用户决定（1000 点横盘里动量 3/3 票凑不齐）：震荡上限 15 -> 25（<25 全走震荡），
+   震荡模式 2/3 票就开，止损 = 沿外 1.5 倍 ATR，止盈 = 对面沿；每单固定 200U 保证金
+B) 放宽止损：趋势/动量止损 2 倍 ATR、止盈 3 倍 ATR、盈亏比 1:1.5
 C) 冷却跳过：3/3 强信号跳过冷却；连亏暂停/消息禁入/每日熔断是硬刹车
 D) 熔断：日熔断 100U；state.json 丢失时收紧到 50U；UTC 午夜恢复 100U
 E) 轮询：持仓 5 秒一轮、空仓 60 秒一轮
@@ -93,11 +95,11 @@ def test_overextension_filter():
 
 
 def test_select_mode():
-    # 2026-11-16 用户决定：按 1h ADX 选模式。>=25 强趋势 trend，15~25 过渡 momentum，<15 震荡 range。
+    # 2026-11-17 用户决定：震荡上限从 15 提到 25，<25 全走震荡，>=25 走趋势；动量只剩 1h ADX 拿不到时的默认兜底。
     check(select_mode(30.0) == "trend", "模式 1h ADX 30 -> trend")
     check(select_mode(25.0) == "trend", "模式 1h ADX 25（边界）-> trend")
-    check(select_mode(20.0) == "momentum", "模式 1h ADX 20 -> momentum")
-    check(select_mode(15.0) == "momentum", "模式 1h ADX 15（边界）-> momentum")
+    check(select_mode(20.0) == "range", "模式 1h ADX 20 -> range（震荡上限提到 25）")
+    check(select_mode(15.0) == "range", "模式 1h ADX 15 -> range")
     check(select_mode(10.0) == "range", "模式 1h ADX 10 -> range")
     check(select_mode(None) == "momentum", "模式 1h ADX 拿不到 -> 默认 momentum")
 
@@ -124,23 +126,53 @@ def test_trend_mode():
 
 
 def test_range_mode():
-    # 2026-11-16 用户决定：range 模式 = 反转策略（3/3 票 + 只在 6h 区间下 1/4 做多、上 1/4 做空）。
-    # 区间 2030~2070，下 1/4 <= 2040，上 1/4 >= 2060；3 倍 ATR = 22.5。
+    # 2026-11-17 用户决定：range 模式 = 反转策略（2/3 票 + 只在 6h 区间下 1/4 做多、上 1/4 做空；
+    # 止损 = 沿外 1.5 倍 ATR，止盈 = 对面沿）。区间 2030~2070，下 1/4 <= 2040，上 1/4 >= 2060；
+    # 1.5 倍 ATR = 11.25。
     rng = dict(range_high=2070.0, range_low=2030.0)
     long_kw = dict(price=2035.0, ma_fast=2045.0, ma_slow=2041.0, midline=2030.0)
-    check(evaluate(**base_kwargs(**long_kw, mode="range", **rng)) is not None,
+    sig = evaluate(**base_kwargs(**long_kw, mode="range", **rng))
+    check(sig is not None and sig["side"] == "LONG" and sig["votes"] == 3,
           "反转 做多 3/3 + 现价在区间下 1/4（2035）触发")
+    check(abs(sig["stop_loss"] - 2018.75) < 0.01,
+          f"反转 做多止损 = 沿外 1.5 倍 ATR：2030-11.25=2018.75（实得 {sig['stop_loss']:.2f}）")
+    check(abs(sig["take_profit_1"] - 2070.0) < 0.01,
+          f"反转 做多止盈 = 对面沿 2070（实得 {sig['take_profit_1']:.1f}）")
+    # 2/3 票也触发：量能不足（volume=50 < 80），均线+分界线两票
+    sig2 = evaluate(**base_kwargs(**long_kw, volume=50.0, mode="range", **rng))
+    check(sig2 is not None and sig2["side"] == "LONG" and sig2["votes"] == 2,
+          "反转 做多 2/3 票触发（量能不足也开）")
+    # 1/3 票挡住
+    check(evaluate(**base_kwargs(price=2035.0, ma_fast=2045.0, ma_slow=2041.0, midline=2040.0,
+                                volume=50.0, mode="range", **rng)) is None,
+          "反转 做多 1/3 票挡住")
     check(evaluate(**base_kwargs(price=2050.0, ma_fast=2055.0, ma_slow=2051.0, midline=2040.0,
                                 mode="range", **rng)) is None,
           "反转 做多 3/3 但现价在区间中间（2050）挡住")
     short_kw = dict(price=2065.0, ma_fast=2060.0, ma_slow=2065.0, midline=2070.0)
-    check(evaluate(**base_kwargs(**short_kw, mode="range", **rng)) is not None,
+    sig3 = evaluate(**base_kwargs(**short_kw, mode="range", **rng))
+    check(sig3 is not None and sig3["side"] == "SHORT",
           "反转 做空 3/3 + 现价在区间上 1/4（2065）触发")
+    check(abs(sig3["stop_loss"] - 2081.25) < 0.01,
+          f"反转 做空止损 = 沿外 1.5 倍 ATR：2070+11.25=2081.25（实得 {sig3['stop_loss']:.2f}）")
+    check(abs(sig3["take_profit_1"] - 2030.0) < 0.01,
+          f"反转 做空止盈 = 对面沿 2030（实得 {sig3['take_profit_1']:.1f}）")
     check(evaluate(**base_kwargs(price=2050.0, ma_fast=2045.0, ma_slow=2050.0, midline=2055.0,
                                 mode="range", **rng)) is None,
           "反转 做空 3/3 但现价在区间中间（2050）挡住")
     check(evaluate(**base_kwargs(**long_kw, mode="range")) is None,
           "反转 没有 6h 区间数据挡住")
+    # 两边同到 2 票时边缘位置决定方向：均线多头 + 分界线下方 + 量能足 = 做多 2 票、做空 2 票，
+    # 现价在下沿区 -> 只做多
+    both = dict(price=2035.0, ma_fast=2045.0, ma_slow=2041.0, midline=2040.0)
+    sig4 = evaluate(**base_kwargs(**both, mode="range", **rng))
+    check(sig4 is not None and sig4["side"] == "LONG",
+          "反转 两边同 2 票、现价在下沿区 -> 做多")
+    # 窄区间：止盈距离低于手续费地板 0.30% 挡住（区间 2048~2053，做多 @2048.5，止盈 4.5 点 = 0.22%）
+    narrow = dict(range_high=2053.0, range_low=2048.0)
+    check(evaluate(**base_kwargs(price=2048.5, ma_fast=2050.0, ma_slow=2049.0, midline=2048.0,
+                                mode="range", **narrow)) is None,
+          "反转 窄区间止盈 4.5 点（0.22%）低于手续费地板挡住")
 
 
 def test_direction_from_15m():
@@ -157,17 +189,22 @@ def test_direction_from_15m():
           "A 两边都不足 3/3 票时挡住")
 
 
-def test_margin_400_and_max_loss():
+def test_fixed_margin_200():
+    # 2026-11-17 用户决定：每单固定 200U 保证金（名义 2000U），不再按固定 10U 风险倒推仓位。
     rm = RiskManager(["BTCUSDT", "ETHUSDT"])
-    qty, margin, max_loss = rm.size_position(entry=73800.0, stop_loss=73800.0 - 210.0)
-    check(350.0 < margin < 400.0, f"A BTC 保证金约 352U（实得 {margin:.1f}U）")
-    check(max_loss < 40.0, f"A BTC 单笔最大亏损 {max_loss:.2f}U < 40U")
-    qty2, margin2, max_loss2 = rm.size_position(entry=73800.0, stop_loss=73800.0 - 100.0)
-    check(abs(margin2 - 400.0) < 0.01, f"A 止损近时保证金封顶 400U（实得 {margin2:.1f}U）")
-    check(max_loss2 < 40.0, f"A 封顶后单笔最大亏损 {max_loss2:.2f}U < 40U")
-    qty3, margin3, max_loss3 = rm.size_position(entry=2058.0, stop_loss=2058.0 - 15.0)
-    check(120.0 < margin3 < 160.0, f"A ETH 保证金约 137U（实得 {margin3:.1f}U）")
-    check(max_loss3 < 40.0, f"A ETH 单笔最大亏损 {max_loss3:.2f}U < 40U")
+    qty, margin, max_loss = rm.size_position(entry=64885.0, stop_loss=64885.0 - 460.0)
+    check(abs(margin - 200.0) < 0.01, f"F 保证金固定 200U（实得 {margin:.1f}U）")
+    check(abs(qty - 2000.0 / 64885.0) < 1e-9, f"F BTC 数量 = 2000/64885（实得 {qty:.5f}）")
+    check(abs(max_loss - (qty * 460.0 + 2000.0 * 0.0007)) < 0.01,
+          f"F BTC 止损 460 点预期最大亏损约 15.6U（实得 {max_loss:.2f}U）")
+    check(max_loss < 40.0, "F BTC 单笔最大亏损 < 40U")
+    qty2, margin2, max_loss2 = rm.size_position(entry=1815.0, stop_loss=1815.0 - 17.0)
+    check(abs(margin2 - 200.0) < 0.01, f"F ETH 保证金固定 200U（实得 {margin2:.1f}U）")
+    check(max_loss2 < 40.0, f"F ETH 单笔最大亏损 {max_loss2:.2f}U < 40U")
+    # 止损距离过大（3%）预期亏损超 40U：放弃这单
+    qty3, margin3, max_loss3 = rm.size_position(entry=100.0, stop_loss=97.0)
+    check(qty3 == 0.0 and margin3 == 0.0, f"F 止损 3% 预期亏损 {max_loss3:.1f}U 超 40U 上限，放弃（数量 {qty3}）")
+    check(max_loss3 > 40.0, "F 超限时返回的预期亏损 > 40U")
 
 
 def test_atr15_sl_tp():
@@ -280,7 +317,7 @@ if __name__ == "__main__":
     test_trend_mode()
     test_range_mode()
     test_direction_from_15m()
-    test_margin_400_and_max_loss()
+    test_fixed_margin_200()
     test_atr15_sl_tp()
     test_widen_stop()
     test_cooldown_bypass()

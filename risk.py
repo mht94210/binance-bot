@@ -6,20 +6,18 @@
 from datetime import datetime, timezone
 
 from config import (
-    ACCOUNT_SIZE_USDT,
     CONSERVATIVE_DAILY_LOSS_USDT,
     CONSECUTIVE_LOSS_PAUSE_MINUTES,
     COOLDOWN_AFTER_SL_MINUTES,
     COOLDOWN_MINUTES,
+    FIXED_MARGIN_PER_TRADE_USDT,
     LEVERAGE,
     MAKER_FEE_PCT,
     MAX_CONSECUTIVE_LOSSES,
     MAX_DAILY_LOSS_USDT,
     MAX_LOSS_PER_TRADE_USDT,
-    MAX_MARGIN_PER_TRADE_USDT,
     MAX_TRADES_PER_DAY,
     NEWS_PAUSE_WINDOWS,
-    RISK_PER_TRADE_PCT,
     TAKER_FEE_PCT,
 )
 
@@ -172,23 +170,17 @@ class RiskManager:
     # ---------- 仓位计算 ----------
     def size_position(self, entry: float, stop_loss: float) -> tuple[float, float, float]:
         """
-        按风险倒推仓位：名义仓位 = 每单风险额 / 止损距离%，保证金按 MAX_MARGIN_PER_TRADE_USDT 封顶。
-        每单风险额 = 本金 x 0.5%（10 U）。返回 (数量, 保证金 USDT, 预期最大亏损 USDT)。
+        固定保证金仓位（2026-11-17 用户决定：每单固定 200U 保证金，跟日本剥头皮一样）：
+        名义仓位 = 200 x 10 = 2000 U，数量 = 2000 / 入场价。止损多远就亏多少，
+        不再按固定 10U 风险倒推仓位。返回 (数量, 保证金 USDT, 预期最大亏损 USDT)。
         预期最大亏损按 Taker 手续费保守估算；超 40 U 硬上限返回数量 0，放弃这单。
         """
         stop_distance = abs(entry - stop_loss)
         if stop_distance <= 0 or entry <= 0:
             return 0.0, 0.0, 0.0
 
-        risk_amount = ACCOUNT_SIZE_USDT * RISK_PER_TRADE_PCT
-        stop_pct = stop_distance / entry
-        notional = risk_amount / stop_pct if stop_pct > 0 else 0.0
-        margin = notional / LEVERAGE
-
-        # 保证金超上限：按 MAX_MARGIN_PER_TRADE_USDT 封顶倒推数量
-        if margin > MAX_MARGIN_PER_TRADE_USDT:
-            margin = MAX_MARGIN_PER_TRADE_USDT
-            notional = margin * LEVERAGE
+        margin = FIXED_MARGIN_PER_TRADE_USDT
+        notional = margin * LEVERAGE
         qty = notional / entry
 
         # 预期最大亏损 = 止损距离的亏损 + 一进一出手续费（保守按 Taker 算）
