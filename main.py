@@ -22,11 +22,11 @@ Binance BTC+ETH 永续合约短线机器人 —— 10 倍快进快出方案（�
 - 10 倍杠杆，每单固定 200 U 保证金，名义仓位 2000 U（2026-11-17 用户决定：不再按固定 10U 风险倒推）
 - 三模式按 1 小时 ADX 智能调配（2026-11-16 用户决定，保留全部策略；2026-11-17 用户决定震荡上限
   从 15 提到 25，横盘让震荡接管）：>=25 强趋势用 trend
-  （原 6 胜策略：EMA50 方向过滤 + 15m ADX>25 + 3/3 票）；<25 震荡用 range（反转：2/3 票 +
+  （原 6 胜策略：EMA50 方向过滤 + 5m ADX>25 + 3/3 票）；<25 震荡用 range（反转：2/3 票 +
   只在 6 小时区间下 1/4 做多、上 1/4 做空，止损沿外 1.5 倍 ATR，止盈到对面沿）；1h ADX 拿不到时
-  默认 momentum（实时信号，15m 均线 3/3 全票，多空由 15 分钟波动决定，ADX 仅参考）；range 有过度延伸过滤
+  默认 momentum（实时信号，5m 均线 3/3 全票，多空由 5 分钟波动决定，ADX 仅参考）；range 有过度延伸过滤
   （离 6 小时极端点超 3 倍 ATR 不追），trend 模式不适用
-- 信号：15 分钟 K 线实时判断（当前未收盘 K 线，每 60 秒一次），趋势/动量 3/3 全票，震荡 2/3 票
+- 信号：5 分钟 K 线实时判断（当前未收盘 K 线，每 60 秒一次），趋势/动量 3/3 全票，震荡 2/3 票
 - 趋势/动量止损 2 倍 ATR，止盈 3 倍 ATR，盈亏比 1:1.5；震荡止损沿外 1.5 倍 ATR，止盈到对面沿；
   止盈目标 < 0.30% 不做
 - 赚到 1 倍风险就把止损移到成本价（保本）；进场限价单，止损市价单
@@ -68,9 +68,11 @@ from config import (
     MAKER_RETRY_BUFFER_PCT,
     MAX_DAILY_LOSS_USDT,
     MAX_OPEN_POSITIONS,
+    MIDLINE_LOOKBACK_CANDLES,
     RANGE_LOOKBACK_CANDLES,
     RECONCILE_RETRY_SECONDS,
     RECV_WINDOW_MS,
+    SIGNAL_INTERVAL,
     SYMBOLS,
     TAKER_FEE_PCT,
     VOL_SMA_PERIOD,
@@ -165,46 +167,47 @@ def get_klines(symbol: str, interval: str, limit: int) -> list[dict]:
 
 
 def compute_indicators(symbol: str) -> dict | None:
-    """拉 15 分钟 K 线，算出信号要用的全部指标。失败返回 None。
+    """拉 5 分钟 K 线，算出信号要用的全部指标。失败返回 None。
     实时信号：用当前未收盘的 K 线判断（不再等收盘），每 60 秒判断一次
     （2026-11-16 用户决定，解决进场晚：原来只用收盘 K 线，每根只判断一次，
     行情走完才看到信号）。
-    信号周期 15 分钟（2026-11-11 用户决定少而精：5 分钟噪音太多）；
-    2026-11-16 用户决定去掉 EMA50 方向过滤和 ADX 门槛，短线看 15 分钟波动选方向，
+    信号周期 5 分钟（2026-11-18 用户决定：15 分钟反弹抓不住，均线翻得慢；
+    2026-11-11 曾因 5 分钟噪音太多选 15 分钟，2026-11-18 改回 5 分钟抓反弹）；
+    2026-11-16 用户决定去掉 EMA50 方向过滤和 ADX 门槛，短线看 5 分钟波动选方向，
     多空来回做。
     """
-    k15 = get_klines(symbol, "15m", 60)
-    if len(k15) < ATR_PERIOD + 2 or len(k15) < ADX_PERIOD * 2 + 1:
-        log(f"{symbol} K 线不够，指标算不出来，等下一根 15 分钟 K 线。")
+    ksig = get_klines(symbol, SIGNAL_INTERVAL, 80)
+    if len(ksig) < ATR_PERIOD + 2 or len(ksig) < ADX_PERIOD * 2 + 1:
+        log(f"{symbol} K 线不够，指标算不出来，等下一根 5 分钟 K 线。")
         return None
-    closes15 = [k["close"] for k in k15]
-    volumes15 = [k["volume"] for k in k15]
-    atr_value = atr(k15, ATR_PERIOD)
-    adx_value, _, _ = adx(k15, ADX_PERIOD)
+    closes = [k["close"] for k in ksig]
+    volumes = [k["volume"] for k in ksig]
+    atr_value = atr(ksig, ATR_PERIOD)
+    adx_value, _, _ = adx(ksig, ADX_PERIOD)
     # 大趋势（1 小时 ADX）决定策略模式：保留全部策略，按大趋势智能调配
     # （2026-11-16 用户决定）。1h K 线拿不到时 adx1h 为 None，模式默认 momentum。
     k1h = get_klines(symbol, "1h", 40)
     adx1h_value, _, _ = adx(k1h, ADX_PERIOD) if len(k1h) >= ADX_PERIOD + 1 else (None, None, None)
     mode = select_mode(adx1h_value)
-    # trend 模式的方向过滤均线（15 分钟 EMA50）
-    ema_trend_value = ema(closes15, EMA_TREND_PERIOD)
-    # 滚动分界线：最近 4 根 15 分钟 K 线（60 分钟）最高最低价的中点，跟着市场走
-    recent = k15[-4:]
+    # trend 模式的方向过滤均线（5 分钟 EMA50）
+    ema_trend_value = ema(closes, EMA_TREND_PERIOD)
+    # 滚动分界线：最近 12 根 5 分钟 K 线（60 分钟）最高最低价的中点，跟着市场走
+    recent = ksig[-MIDLINE_LOOKBACK_CANDLES:]
     midline = (max(k["high"] for k in recent) + min(k["low"] for k in recent)) / 2
     # 6 小时区间高低点：过度延伸过滤用（跌多了不追空、涨多了不追多）
-    range_window = k15[-RANGE_LOOKBACK_CANDLES:]
+    range_window = ksig[-RANGE_LOOKBACK_CANDLES:]
     range_high = max(k["high"] for k in range_window)
     range_low = min(k["low"] for k in range_window)
     return {
-        "candle_open_time": k15[-1]["open_time"],
-        "price": k15[-1]["close"],
+        "candle_open_time": ksig[-1]["open_time"],
+        "price": ksig[-1]["close"],
         "atr": atr_value,
         "adx15": adx_value,
-        "ma_fast": sma(closes15, MA_FAST_PERIOD),
-        "ma_slow": sma(closes15, MA_SLOW_PERIOD),
+        "ma_fast": sma(closes, MA_FAST_PERIOD),
+        "ma_slow": sma(closes, MA_SLOW_PERIOD),
         "midline": midline,
-        "volume": k15[-1]["volume"],
-        "volume_sma": sma(volumes15, VOL_SMA_PERIOD),
+        "volume": ksig[-1]["volume"],
+        "volume_sma": sma(volumes, VOL_SMA_PERIOD),
         "range_high": range_high,
         "range_low": range_low,
         "adx1h": adx1h_value,
@@ -1089,9 +1092,9 @@ def main() -> None:
     log("=" * 60)
     log("BTC+ETH 合约短线机器人启动（10 倍快进快出方案，2026-11-10 用户确认；2026-11-11 加 ETH）")
     log(f"标的: {', '.join(SYMBOLS)} | Dry-Run: {DRY_RUN} | 实盘开关: {LIVE_TRADING_ENABLED} | 实盘已开: {live_trading_active()}")
-    log("策略: 三模式按 1 小时 ADX 智能调配（>=25 强趋势用 trend 原 6 胜策略：EMA50 方向过滤 + 15m ADX>25；"
+    log("策略: 三模式按 1 小时 ADX 智能调配（>=25 强趋势用 trend 原 6 胜策略：EMA50 方向过滤 + 5m ADX>25；"
         "<25 震荡用 range 反转策略：2/3 票 + 只在 6 小时区间下 1/4 做多、上 1/4 做空，止损沿外 1.5 倍 ATR，"
-        "止盈到对面沿；1h ADX 拿不到时默认 momentum 动量策略：实时信号，15m 均线 3/3 全票，多空由 15 分钟波动决定，ADX 仅参考；"
+        "止盈到对面沿；1h ADX 拿不到时默认 momentum 动量策略：实时信号，5m 均线 3/3 全票，多空由 5 分钟波动决定，ADX 仅参考；"
         "range 有过度延伸过滤：离 6 小时极端点超 3 倍 ATR 不追）+ 量能过滤；"
         "趋势/动量止损 2 倍 ATR，止盈 3 倍 ATR，盈亏比 1:1.5；赚 1 倍风险保本；"
         "进场限价单，止损市价单；冷却 15 分钟（止损后 30 分钟，3/3 强信号可跳过）；"
@@ -1161,7 +1164,7 @@ def main() -> None:
                 f"{MAX_DAILY_LOSS_USDT:.0f} U 收紧到 {CONSERVATIVE_DAILY_LOSS_USDT:.0f} U，"
                 f"免得今天实际亏超 {MAX_DAILY_LOSS_USDT:.0f} U；UTC 午夜自动恢复。")
 
-    # 启动预热：跳过当前这根 15 分钟 K 线，等下一根收盘再判断，
+    # 启动预热：跳过当前这根 5 分钟 K 线，等下一根收盘再判断，
     # 避免重启后几秒钟就按一根快收完的 K 线立即开单。
     _warmed = False
     for symbol in SYMBOLS:
@@ -1173,7 +1176,7 @@ def main() -> None:
         except Exception:  # noqa: BLE001
             pass
     if _warmed:
-        log("启动预热：已跳过当前 15 分钟 K 线，等下一根收盘再判断。")
+        log("启动预热：已跳过当前 5 分钟 K 线，等下一根收盘再判断。")
 
     # 实盘：建下单器 + 启动对账（下单器建不起来就拒绝启动，绝不半实盘跑）
     live_trader = None
@@ -1295,7 +1298,7 @@ def main() -> None:
                         f"保本{'已移' if position['breakeven_done'] else '未触发'}。")
                 continue
 
-            # ---------- 无持仓：实时判断，不等 15 分钟 K 线收盘 ----------
+            # ---------- 无持仓：实时判断，不等 5 分钟 K 线收盘 ----------
             # 实时信号（2026-11-16 用户决定，解决进场晚）：同一根未收盘 K 线每 60 秒
             # 重新判断一次；没信号时只在新 K 线才记日志，免得刷屏。
             # 持仓时主循环 5 秒一轮，空仓币种不能每 5 秒拉 3 组 K 线：60 秒最多判断一次。
@@ -1322,7 +1325,7 @@ def main() -> None:
                               log=log if is_new_candle else None)
             if signal is None:
                 if is_new_candle:
-                    log(f"无信号，{symbol} 现价 {price:.1f}（15m 收 {indicators['price']:.1f}），继续等。")
+                    log(f"无信号，{symbol} 现价 {price:.1f}（5m 收 {indicators['price']:.1f}），继续等。")
                 continue
 
             signal["symbol"] = symbol

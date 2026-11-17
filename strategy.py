@@ -14,13 +14,16 @@
 2026-11-17 用户决定（1000 点横盘里动量模式 3/3 票凑不齐、震荡模式够不着）：震荡上限
 从 15 提到 25，<25 全走震荡；震荡模式 2/3 票就开，止损 = 区间沿外 1.5 倍 ATR，
 止盈 = 对面沿；动量模式只剩 1h ADX 拿不到时的默认兜底。
-- 信号：实时判断（当前未收盘的 15 分钟 K 线，每 60 秒一次）；均线方向、分界线、
-  量能三项必须全中（趋势/动量 3/3 全票，震荡 2/3 票），多空由 15 分钟波动决定（均线/分界线/量能）；
+2026-11-18 用户决定（15 分钟信号反弹抓不住：均线翻得慢，等反弹确认又要等下一个 15 分钟，
+机会全错过）：信号周期改成 5 分钟；1h ADX 定模式、6 小时区间、止损止盈倍数、固定 200U、
+冷却/熔断都不变。
+- 信号：实时判断（当前未收盘的 5 分钟 K 线，每 60 秒一次）；均线方向、分界线、
+  量能三项必须全中（趋势/动量 3/3 全票，震荡 2/3 票），多空由 5 分钟波动决定（均线/分界线/量能）；
   止盈目标 < 0.30% 不做；冷却与额度由风控器管。
 - 过度延伸过滤（2026-11-16 用户决定）：做空时现价比 6 小时高点跌超 3 倍 ATR
   就不追空，做多时现价比 6 小时低点涨超 3 倍 ATR 就不追多——信号打在反转点
   是因为跌得越狠信号越强，过度延伸就是衰竭。
-- 止损止盈：趋势/动量按 15 分钟 ATR 算，止损 2 倍 ATR，止盈 3 倍 ATR，盈亏比 1:1.5；
+- 止损止盈：趋势/动量按 5 分钟 ATR 算，止损 2 倍 ATR，止盈 3 倍 ATR，盈亏比 1:1.5；
   震荡按区间沿算，止损 = 沿外 1.5 倍 ATR，止盈 = 对面沿。
 - 手续费地板：止盈目标 < 0.30% 不做（按实际止盈距离算）。
 - 保本和出场由 main.py 管：赚到 1 倍风险就把止损移到成本价。
@@ -92,13 +95,13 @@ def evaluate(price: float, atr: float | None,
              mode: str = "momentum", ema_trend: float | None = None,
              log=None) -> dict | None:
     """
-    实时判断：每 60 秒用当前未收盘的 15 分钟 K 线调用一次。price 是判断时的实时价
+    实时判断：每 60 秒用当前未收盘的 5 分钟 K 线调用一次。price 是判断时的实时价
     （不是那根 K 线的收盘价，避免入场价滞后）；指标（ATR/ADX/均线/分界线/量能）
-    按含当前未收盘 K 线的 15 分钟 K 线算（2026-11-16 用户决定，解决进场晚）。
+    按含当前未收盘 K 线的 5 分钟 K 线算（2026-11-16 用户决定，解决进场晚）。
     range_high / range_low 是过去 6 小时区间的最高最低价（不传则不过度延伸过滤，
     range 模式也做不了位置确认）。
     mode 是策略模式（select_mode 按 1 小时 ADX 选出）：trend / momentum / range。
-    ema_trend 是 15 分钟 EMA50（只 trend 模式用）。
+    ema_trend 是 5 分钟 EMA50（只 trend 模式用）。
     指标缺失（预热期）时直接返回 None，不过滤也不开单。
     返回信号 dict，或 None（无信号）。信号一定带 stop_loss 和 take_profit。
     被某道闸门挡住时，如传了 log 就记一条原因，方便查为什么没开单。
@@ -106,10 +109,10 @@ def evaluate(price: float, atr: float | None,
     三种模式（2026-11-16 用户决定：保留全部策略，按大趋势智能调配，共用风控，
     只换开单规则；2026-11-17 用户决定：震荡上限从 15 提到 25，横盘让震荡接管，
     震荡模式 2/3 票就开）：
-    - trend（原 6 胜策略思路）：15 分钟 ADX > 25 才做；方向必须顺 EMA50（现价在
+    - trend（原 6 胜策略思路）：5 分钟 ADX > 25 才做；方向必须顺 EMA50（现价在
       EMA50 上方只做多、下方只做空）；3/3 票。过度延伸过滤不适用（大趋势就是要追，
       过滤会把大跌里的空单全挡掉）。止损 2 倍 ATR、止盈 3 倍 ATR。
-    - momentum（当前动量策略）：3/3 票就进，多空由 15 分钟波动决定，ADX 只参考；
+    - momentum（当前动量策略）：3/3 票就进，多空由 5 分钟波动决定，ADX 只参考；
       再加过度延伸过滤（跌多了不追空、涨多了不追多）。止损 2 倍 ATR、止盈 3 倍 ATR。
       2026-11-17 起只剩 1h ADX 拿不到时的默认兜底。
     - range（反转策略）：2/3 票 + 位置确认——只在 6 小时区间下 1/4 做多、上 1/4
@@ -122,11 +125,11 @@ def evaluate(price: float, atr: float | None,
         return None
 
     if atr is None or atr <= 0:
-        return _blocked("ATR 还没算出来（15 分钟 K 线不够 15 根），等预热。")
+        return _blocked("ATR 还没算出来（5 分钟 K 线不够 15 根），等预热。")
     if adx15 is None:
-        return _blocked("15 分钟 ADX 还没算出来，等预热。")
+        return _blocked("5 分钟 ADX 还没算出来，等预热。")
     if ma_fast is None or ma_slow is None:
-        return _blocked("15 分钟均线还没算出来，等预热。")
+        return _blocked("5 分钟均线还没算出来，等预热。")
 
     votes_long = _votes_long(price, ma_fast, ma_slow, midline, volume, volume_sma)
     votes_short = _votes_short(price, ma_fast, ma_slow, midline, volume, volume_sma)
@@ -139,14 +142,14 @@ def evaluate(price: float, atr: float | None,
         # 原 6 胜策略：ADX 门槛 + EMA50 方向过滤；过度延伸过滤不适用（大趋势就是要追，
         # 过滤会把大跌里的空单全挡掉）。
         if adx15 <= TREND_ADX_MIN:
-            return _blocked(f"趋势模式：15 分钟 ADX {adx15:.0f} 不到 {TREND_ADX_MIN:.0f}，不做。")
+            return _blocked(f"趋势模式：5 分钟 ADX {adx15:.0f} 不到 {TREND_ADX_MIN:.0f}，不做。")
         if ema_trend is None:
             return _blocked("趋势模式：EMA50 还没算出来，等预热。")
         if votes_long == 3 and price <= ema_trend:
             return _blocked("趋势模式：做多 3/3 票但现价在 EMA50 下方（逆势），不做。")
         if votes_short == 3 and price >= ema_trend:
             return _blocked("趋势模式：做空 3/3 票但现价在 EMA50 上方（逆势），不做。")
-        mode_label = f"趋势模式（EMA50，15m ADX {adx15:.0f}>{TREND_ADX_MIN:.0f}）"
+        mode_label = f"趋势模式（EMA50，5m ADX {adx15:.0f}>{TREND_ADX_MIN:.0f}）"
     elif mode == "range":
         # 反转策略：位置确认——只在 6 小时区间下 1/4 做多、上 1/4 做空；2/3 票就开。
         if range_high is None or range_low is None:
@@ -215,7 +218,7 @@ def evaluate(price: float, atr: float | None,
                 "take_profit_2": None,
                 "atr": atr,
                 "votes": votes,
-                "reason": f"{mode_label}做多 {votes}/3 票（15m 均线多头），{sl_note}",
+                "reason": f"{mode_label}做多 {votes}/3 票（5m 均线多头），{sl_note}",
                 "mode": mode,
             }
         return {
@@ -227,7 +230,7 @@ def evaluate(price: float, atr: float | None,
             "take_profit_2": None,
             "atr": atr,
             "votes": votes,
-            "reason": f"{mode_label}做空 {votes}/3 票（15m 均线空头），{sl_note}",
+            "reason": f"{mode_label}做空 {votes}/3 票（5m 均线空头），{sl_note}",
             "mode": mode,
         }
 

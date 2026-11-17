@@ -1,12 +1,14 @@
 """机器人规则回归总测（放在仓库里，虚拟机重启也不丢）。
 
 覆盖用户确认过的全部规则（2026-11-11）：
-A) 少而精：3/3 全票、保证金 400U、15m 信号/ATR；2026-11-16 去掉 EMA50 方向过滤，短线看 15 分钟波动选方向；
+A) 少而精：3/3 全票、保证金 400U、5m 信号/ATR；2026-11-16 去掉 EMA50 方向过滤，短线看 5 分钟波动选方向；
    2026-11-16 再去掉 ADX 门槛 + 实时信号（当前未收盘 K 线，每 60 秒判断一次），解决进场晚；
    2026-11-16 再加三模式（保留全部策略，按 1h ADX 智能调配：>=25 trend 原 6 胜策略，15~25 momentum，
    <15 range 反转）+ 过度延伸过滤（跌多了不追空、涨多了不追多）
    2026-11-17 用户决定（1000 点横盘里动量 3/3 票凑不齐）：震荡上限 15 -> 25（<25 全走震荡），
    震荡模式 2/3 票就开，止损 = 沿外 1.5 倍 ATR，止盈 = 对面沿；每单固定 200U 保证金
+   2026-11-18 用户决定（15 分钟信号反弹抓不住）：信号周期改成 5 分钟；1h ADX 定模式、6 小时区间、
+   止损止盈倍数、固定 200U、冷却/熔断都不变；区间回看 72 根 5 分钟 K 线，分界线回看 12 根
 B) 放宽止损：趋势/动量止损 2 倍 ATR、止盈 3 倍 ATR、盈亏比 1:1.5
 C) 冷却跳过：3/3 强信号跳过冷却；连亏暂停/消息禁入/每日熔断是硬刹车
 D) 熔断：日熔断 100U；state.json 丢失时收紧到 50U；UTC 午夜恢复 100U
@@ -25,9 +27,14 @@ from config import (
     HOLDING_POLL_SECONDS,
     MAX_DAILY_LOSS_USDT,
     MAX_MARGIN_PER_TRADE_USDT,
+    MIDLINE_LOOKBACK_CANDLES,
+    RANGE_LOOKBACK_CANDLES,
+    SIGNAL_INTERVAL,
+    SIGNAL_INTERVAL_MINUTES,
     SL_ATR_MULT,
     TP_ATR_MULT,
 )
+import main
 from risk import RiskManager
 from strategy import evaluate, select_mode
 
@@ -105,7 +112,7 @@ def test_select_mode():
 
 
 def test_trend_mode():
-    # 2026-11-16 用户决定：trend 模式 = 原 6 胜策略思路（EMA50 方向过滤 + 15m ADX>25 + 3/3 票）。
+    # 2026-11-16 用户决定：trend 模式 = 原 6 胜策略思路（EMA50 方向过滤 + 5m ADX>25 + 3/3 票）。
     # 过度延伸过滤不适用（大趋势就是要追）。
     check(evaluate(**base_kwargs(mode="trend", ema_trend=2050.0, range_high=2070.0)) is not None,
           "趋势 做空 3/3 + 现价在 EMA50 下方 + ADX 35>25 触发（跌 30 点也不被过度延伸挡）")
@@ -115,7 +122,7 @@ def test_trend_mode():
     check(evaluate(**base_kwargs(mode="trend", ema_trend=2030.0)) is None,
           "趋势 做空 3/3 但现价在 EMA50 上方（逆势）挡住")
     check(evaluate(**base_kwargs(mode="trend", ema_trend=2050.0, adx15=20.0)) is None,
-          "趋势 15m ADX 20 不到 25 挡住")
+          "趋势 5m ADX 20 不到 25 挡住")
     check(evaluate(**base_kwargs(mode="trend", ema_trend=None)) is None,
           "趋势 EMA50 没算出来挡住")
     long_kw = dict(price=2070.0, ma_fast=2065.0, ma_slow=2060.0, midline=2060.0)
@@ -175,16 +182,16 @@ def test_range_mode():
           "反转 窄区间止盈 4.5 点（0.22%）低于手续费地板挡住")
 
 
-def test_direction_from_15m():
-    # 2026-11-16 用户决定：去掉 EMA50 方向过滤，短线看 15 分钟波动选方向。
-    # 做多/做空只看 15 分钟三票，不再被高周期均线挡住。
+def test_direction_from_5m():
+    # 2026-11-16 用户决定：去掉 EMA50 方向过滤，短线看 5 分钟波动选方向。
+    # 做多/做空只看 5 分钟三票，不再被高周期均线挡住。
     sig_long = evaluate(**base_kwargs(price=2070.0,
                                       ma_fast=2065.0, ma_slow=2060.0, midline=2060.0))
     check(sig_long is not None and sig_long["side"] == "LONG",
-          "A 15m 做多 3/3 票直接放行（无 EMA 方向限制）")
+          "A 5m 做多 3/3 票直接放行（无 EMA 方向限制）")
     sig_short = evaluate(**base_kwargs())
     check(sig_short is not None and sig_short["side"] == "SHORT",
-          "A 15m 做空 3/3 票直接放行（无 EMA 方向限制）")
+          "A 5m 做空 3/3 票直接放行（无 EMA 方向限制）")
     check(evaluate(**base_kwargs(ma_fast=2046.0, midline=2050.0, volume=50.0)) is None,
           "A 两边都不足 3/3 票时挡住")
 
@@ -207,12 +214,58 @@ def test_fixed_margin_200():
     check(max_loss3 > 40.0, "F 超限时返回的预期亏损 > 40U")
 
 
-def test_atr15_sl_tp():
+def test_atr5_sl_tp():
     sig = evaluate(**base_kwargs(atr=225.0))
-    check(sig is not None, "A 15m ATR 信号触发")
+    check(sig is not None, "A 5m ATR 信号触发")
     check(abs(sig["stop_loss"] - 2490.0) < 0.01, f"A 止损 2040+450=2490（实得 {sig['stop_loss']:.1f}）")
     check(abs(sig["take_profit_1"] - 1365.0) < 0.01, f"A 止盈 2040-675=1365（实得 {sig['take_profit_1']:.1f}）")
-    check("15m" in sig["reason"], "A 信号原因里写 15m 共振")
+    check("5m" in sig["reason"], "A 信号原因里写 5m 共振")
+
+
+def test_signal_timeframe_5m():
+    # 2026-11-18 用户决定：信号周期 15 分钟 -> 5 分钟（反弹抓不住）；1h ADX 定模式、
+    # 6 小时区间、止损止盈倍数不变。回看窗口按时间换算：区间 6 小时 = 72 根 5 分钟 K 线，
+    # 分界线 60 分钟 = 12 根 5 分钟 K 线。
+    check(SIGNAL_INTERVAL == "5m", f"A 信号周期 5m（实得 {SIGNAL_INTERVAL}）")
+    check(SIGNAL_INTERVAL_MINUTES == 5, f"A 信号周期 5 分钟（实得 {SIGNAL_INTERVAL_MINUTES}）")
+    check(RANGE_LOOKBACK_CANDLES == 72, f"A 6 小时区间回看 72 根 5m K 线（实得 {RANGE_LOOKBACK_CANDLES}）")
+    check(MIDLINE_LOOKBACK_CANDLES == 12, f"A 分界线回看 12 根 5m K 线（实得 {MIDLINE_LOOKBACK_CANDLES}）")
+    # compute_indicators 必须拉 5m K 线（80 根，够 72 根区间回看 + EMA50），
+    # 区间高低取最后 72 根，分界线取最后 12 根，1h ADX 仍拉 1h K 线定模式。
+    from unittest.mock import patch
+
+    def _candle(i, base):
+        c = base + i * 10.0
+        return {"open_time": i * 300000, "open": c, "high": c + 5.0,
+                "low": c - 5.0, "close": c, "volume": 100.0}
+
+    k5m = [_candle(i, 63000.0) for i in range(80)]
+    k1h = [{"open_time": i * 3600000, "open": 64000.0, "high": 64010.0,
+            "low": 63990.0, "close": 64000.0, "volume": 50.0} for i in range(40)]
+    calls = []
+
+    def _fake_klines(symbol, interval, limit):
+        calls.append((symbol, interval, limit))
+        return k5m if interval == "5m" else k1h
+
+    with patch.object(main, "get_klines", side_effect=_fake_klines):
+        ind = main.compute_indicators("BTCUSDT")
+    check(calls[0] == ("BTCUSDT", "5m", 80), f"A 信号 K 线拉 5m 80 根（实得 {calls[0]}）")
+    check(calls[1] == ("BTCUSDT", "1h", 40), f"A 1h ADX 仍拉 1h K 线（实得 {calls[1]}）")
+    check(ind is not None, "A 5m K 线够用，指标算得出来")
+    if ind is not None:
+        win72 = k5m[-72:]
+        exp_high = max(k["high"] for k in win72)
+        exp_low = min(k["low"] for k in win72)
+        check(abs(ind["range_high"] - exp_high) < 1e-9,
+              f"A 区间高点 = 最后 72 根最高价（实得 {ind['range_high']:.1f}，预期 {exp_high:.1f}）")
+        check(abs(ind["range_low"] - exp_low) < 1e-9,
+              f"A 区间低点 = 最后 72 根最低价（实得 {ind['range_low']:.1f}，预期 {exp_low:.1f}）")
+        win12 = k5m[-12:]
+        exp_mid = (max(k["high"] for k in win12) + min(k["low"] for k in win12)) / 2
+        check(abs(ind["midline"] - exp_mid) < 1e-9,
+              f"A 分界线 = 最后 12 根高低中点（实得 {ind['midline']:.1f}，预期 {exp_mid:.1f}）")
+        check(ind["mode"] == "range", f"A 1h ADX 小 -> range 模式（实得 {ind['mode']}）")
 
 
 # ---------- B) 放宽止损 ----------
@@ -316,9 +369,10 @@ if __name__ == "__main__":
     test_select_mode()
     test_trend_mode()
     test_range_mode()
-    test_direction_from_15m()
+    test_direction_from_5m()
     test_fixed_margin_200()
-    test_atr15_sl_tp()
+    test_atr5_sl_tp()
+    test_signal_timeframe_5m()
     test_widen_stop()
     test_cooldown_bypass()
     test_daily_halt()
