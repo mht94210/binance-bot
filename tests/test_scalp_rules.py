@@ -1,11 +1,14 @@
 """剥头皮测试版规则回归（放在仓库里，虚拟机重启也不丢）。
 
-和德国实盘版的区别只有四处（用户 2026-11-17 决定：先做模拟盘版本测几天，放日本服务器跑）：
+和德国实盘版的区别只有五处（用户 2026-11-17 决定：先做模拟盘版本测几天，放日本服务器跑）：
 A) 止损 3 倍 ATR（放远了，不会被噪音突然打掉；实盘版是 2 倍）
 B) 止盈不再按 ATR：浮盈扣掉全部手续费，净赚 2U 就平（止盈价按仓位反推）
 C) 每天每币上限 50 单（用户目标一天 100 单；模拟盘测试，额度不做瓶颈）
 D) 每单固定 200U 保证金（用户 2026-11-17 决定；10 倍杠杆 = 2000U 名义仓位；仓位不再按风险倒推）
-其余照抄实盘版：三模式信号、3/3 全票、冷却、熔断、保本逻辑都不动。
+E) 简化信号（用户 2026-11-17 决定：均线定方向 + 2/3 票就开）：方向只看 5 分钟 MA5/MA20，
+   三个投票（均线/分界线/量能）里 2 票就开；不要三模式、不要 ADX、不要 EMA50、
+   不要过度延伸过滤（原来三模式 + 3/3 全票太严，200U 版上线 1 小时一单没开）
+其余照抄实盘版：冷却、熔断、保本逻辑都不动。
 
 用法：python3 tests/test_scalp_rules.py
 """
@@ -18,7 +21,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import (
     MAKER_FEE_PCT,
     MAX_TRADES_PER_DAY,
-    RANGE_LOOKBACK_CANDLES,
     SCALP_NET_TP_USDT,
     SIGNAL_INTERVAL,
     SL_ATR_MULT,
@@ -40,7 +42,7 @@ def check(cond, label):
 def base_kwargs(**over):
     # BTC 价位：价格 64500，5m ATR 242（测试用合成值；逻辑与 ATR 大小无关）
     kw = dict(price=64500.0, atr=242.0,
-              adx5=10.0, ma_fast=64400.0, ma_slow=64500.0, midline=64550.0,
+              ma_fast=64400.0, ma_slow=64500.0, midline=64550.0,
               volume=100.0, volume_sma=80.0)
     kw.update(over)
     return kw
@@ -57,19 +59,18 @@ def net_pnl_at(side, entry, qty, exit_price, exit_is_maker):
     return close_pnl(pos, exit_price, exit_is_maker)
 
 
-# ---------- 0) 信号周期 5 分钟，6 小时区间 = 72 根 ----------
+# ---------- 0) 信号周期 5 分钟 ----------
 check(SIGNAL_INTERVAL == "5m", "0 信号周期 5 分钟")
-check(RANGE_LOOKBACK_CANDLES == 72, "0 6 小时区间 = 72 根 5 分钟 K 线")
 
 # ---------- A) 止损 3 倍 ATR ----------
 sig_s = evaluate(**base_kwargs())
 check(sig_s is not None and sig_s["side"] == "SHORT",
-      "A 3/3 全票做空信号触发")
+      "A 做空信号触发（均线向下 + 2/3 票）")
 check(sig_s is not None and abs(sig_s["stop_loss"] - sig_s["entry"]) == 3 * 242.0,
       "A 止损 = 3 倍 ATR（726 点）")
 sig_l = evaluate(**long_kwargs())
 check(sig_l is not None and sig_l["side"] == "LONG",
-      "A 3/3 全票做多信号触发")
+      "A 做多信号触发（均线向上 + 2/3 票）")
 check(sig_l is not None and abs(sig_l["entry"] - sig_l["stop_loss"]) == 3 * 242.0,
       "A 做多止损也是 3 倍 ATR")
 check(SL_ATR_MULT == 3.0, "A SL_ATR_MULT = 3.0")
@@ -116,8 +117,21 @@ qty3, margin3, _ = risk.size_position(1840.0, 1840.0 - 12.0)
 check(abs(margin3 - 200.0) < 0.01 and abs(qty3 - 2000.0 / 1840.0) < 1e-6,
       f"D ETH 入场 1840 数量 = 2000/1840（算出 qty {qty3:.5f}，保证金 {margin3:.1f}U）")
 
-# ---------- 3/3 全票仍是硬门槛 ----------
-check(evaluate(**base_kwargs(volume=50.0)) is None, "D 2/3 票挡住（量能不足）")
+# ---------- E) 简化信号：均线定方向 + 2/3 票就开 ----------
+# 量能不足：均线 + 分界线 = 2 票，照样开（原来 3/3 全票会挡住）
+check(evaluate(**base_kwargs(volume=50.0)) is not None, "E 2/3 票就开（量能不足）")
+# 只有均线一票：挡住
+check(evaluate(**base_kwargs(volume=50.0, midline=64450.0)) is None, "E 1/3 票挡住（只有均线一票）")
+# 方向只看均线：做多也有 2 票（分界线+量能），但 MA5 在 MA20 下方，只做空不做多
+sig_both = evaluate(**base_kwargs(midline=64450.0))
+check(sig_both is not None and sig_both["side"] == "SHORT",
+      "E 均线向下时做空（即使做多也有 2 票，方向只看均线）")
+# 反向：做空也有 2 票，但 MA5 在 MA20 上方，只做多不做空
+sig_both_l = evaluate(**long_kwargs(midline=64550.0))
+check(sig_both_l is not None and sig_both_l["side"] == "LONG",
+      "E 均线向上时做多（即使做空也有 2 票，方向只看均线）")
+# ADX 再低也不挡信号（没有 ADX 门槛了）；EMA50/过度延伸也不挡
+check(evaluate(**base_kwargs()) is not None, "E 不用 ADX/EMA50/过度延伸过滤也能开单")
 
 # ---------- 模拟盘开关：config.json 明确关实盘 ----------
 cfg = json.loads((Path(__file__).resolve().parent.parent / "config.json").read_text(encoding="utf-8"))
