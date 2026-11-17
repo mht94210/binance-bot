@@ -825,7 +825,7 @@ def manage_live_position(symbol: str, position: dict, price: float, now: float,
         kind = "止盈" if res["kind"] == "TP" else ("止损" if was_sl else "保本出场")
         log(f"平仓 [{kind}]：{symbol} {position['side']} 入场 {position['entry']:.1f} 出场 {exit_price:.1f}，"
             f"本单盈亏 {pnl:+.2f} U，今日累计 {risk.daily_pnl_usdt + pnl:+.2f} U。")
-        risk.record_trade_closed(symbol, pnl, was_sl=was_sl, now=now)
+        risk.record_trade_closed(symbol, pnl, was_sl=was_sl, now=now, side=position["side"])
         positions[symbol] = None
         save_state()
         return
@@ -838,7 +838,7 @@ def manage_live_position(symbol: str, position: dict, price: float, now: float,
         log(f"严重：{symbol} 交易所持仓已为 0，但止盈/止损订单没显示成交（可能人工平仓），"
             f"按现价 {price:.1f} 平账（盈亏为估算）。")
         pnl = close_pnl(position, price, exit_is_maker=False)
-        risk.record_trade_closed(symbol, pnl, was_sl=False, now=now)
+        risk.record_trade_closed(symbol, pnl, was_sl=False, now=now, side=position["side"])
         positions[symbol] = None
         save_state()
         return
@@ -959,7 +959,7 @@ def reconcile_live_positions(live_trader: LiveTrader, positions: dict,
             was_sl = bool(exit_order and (exit_order.get("type") == "STOP_MARKET"
                           or exit_order.get("origType") == "STOP_MARKET")
                           and abs(float(exit_order.get("stopPrice") or 0) - saved["entry"]) > 1e-9)
-            risk.record_trade_closed(symbol, pnl, was_sl=was_sl, now=time.time())
+            risk.record_trade_closed(symbol, pnl, was_sl=was_sl, now=time.time(), side=saved.get("side"))
             positions[symbol] = None
             save_state()
             continue
@@ -1041,7 +1041,7 @@ def reconcile_live_positions(live_trader: LiveTrader, positions: dict,
                 continue
             if saved is not None:
                 pnl = close_pnl(saved, st["mark"] or entry, exit_is_maker=False)
-                risk.record_trade_closed(symbol, pnl, was_sl=False, now=time.time())
+                risk.record_trade_closed(symbol, pnl, was_sl=False, now=time.time(), side=side)
             positions[symbol] = None
             save_state()
             continue
@@ -1071,7 +1071,7 @@ def main() -> None:
         "下面只做空；三个投票（均线/分界线/量能）里 2 票就开；不要 ADX 分模式、不要 EMA50 过滤、"
         "不要过度延伸过滤；"
         "止损 3 倍 ATR（放远了），止盈净赚 2U 就平（浮盈扣掉全部手续费）；每单固定 200U 保证金；"
-        "进场限价单，止损市价单；冷却 15 分钟（止损后 30 分钟，3/3 强信号可跳过）；"
+        "进场限价单，止损市价单；冷却 15 分钟（止损后 30 分钟，同方向 3/3 也不跳过，反向 3/3 可跳过）；"
         "每个币种一天最多 50 单、同时最多 1 单（全账户同时最多 2 单）")
     log("风控: 10 倍 / 单笔保证金固定 200U / 单笔亏损硬上限 40U / "
         f"日亏熔断 {MAX_DAILY_LOSS_USDT:.0f}U / 连亏 3 单休息 1 小时 / 大消息前后 30 分钟不交易")
@@ -1258,7 +1258,7 @@ def main() -> None:
                     kind = "止盈" if hit_tp else ("止损" if was_sl else "保本出场")
                     log(f"平仓 [{kind}]：{symbol} {side} 入场 {entry:.1f} 出场 {price:.1f}，"
                         f"本单盈亏 {pnl:+.2f} U，今日累计 {risk.daily_pnl_usdt + pnl:+.2f} U。")
-                    risk.record_trade_closed(symbol, pnl, was_sl=was_sl, now=now)
+                    risk.record_trade_closed(symbol, pnl, was_sl=was_sl, now=now, side=side)
                     positions[symbol] = None
                     save_state()
                     continue
@@ -1307,7 +1307,8 @@ def main() -> None:
                 continue
 
             ok, reason = risk.can_trade(symbol, now=now,
-                                        votes=signal.get("votes", 0))
+                                        votes=signal.get("votes", 0),
+                                        side=signal["side"])
             if not ok:
                 log(f"风控拦截：{reason}")
                 continue

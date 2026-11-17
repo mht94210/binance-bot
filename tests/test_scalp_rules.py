@@ -133,6 +133,33 @@ check(sig_both_l is not None and sig_both_l["side"] == "LONG",
 # ADX 再低也不挡信号（没有 ADX 门槛了）；EMA50/过度延伸也不挡
 check(evaluate(**base_kwargs()) is not None, "E 不用 ADX/EMA50/过度延伸过滤也能开单")
 
+# ---------- F) 同方向冷却：刚平仓后同方向 3/3 也不跳过冷却，反向才跳过（用户 2026-11-17 决定）----------
+# 背景：J4 ETH 空单止盈后 5 秒，J5 又开了同方向空单（3/3 跳过了冷却）——用户要求同方向必须等满冷却。
+_t0 = 1794906000.0  # 2026-11-17 09:00 UTC，不在大消息窗口里
+risk_f = RiskManager(["ETHUSDT"])
+risk_f.record_trade_closed("ETHUSDT", 3.02, was_sl=False, now=_t0, side="SHORT")
+ok_same, _ = risk_f.can_trade("ETHUSDT", now=_t0 + 5, votes=3, side="SHORT")
+check(not ok_same, "F 同方向做空 3/3 也要等冷却（刚平空单 5 秒）")
+ok_rev, _ = risk_f.can_trade("ETHUSDT", now=_t0 + 5, votes=3, side="LONG")
+check(ok_rev, "F 反向做多 3/3 可跳过冷却")
+ok_rev2, _ = risk_f.can_trade("ETHUSDT", now=_t0 + 5, votes=2, side="LONG")
+check(not ok_rev2, "F 反向 2/3 票仍要等冷却")
+ok_later, _ = risk_f.can_trade("ETHUSDT", now=_t0 + 15 * 60 + 1, votes=2, side="SHORT")
+check(ok_later, "F 冷却满 15 分钟后同方向可开")
+# 止损后冷却 30 分钟：同方向 3/3 在 20 分钟时仍挡住，反向放行
+risk_f2 = RiskManager(["ETHUSDT"])
+risk_f2.record_trade_closed("ETHUSDT", -11.21, was_sl=True, now=_t0, side="SHORT")
+ok_sl, _ = risk_f2.can_trade("ETHUSDT", now=_t0 + 20 * 60, votes=3, side="SHORT")
+check(not ok_sl, "F 止损后 30 分钟冷却，同方向 3/3 在 20 分钟时仍挡住")
+ok_sl_rev, _ = risk_f2.can_trade("ETHUSDT", now=_t0 + 20 * 60, votes=3, side="LONG")
+check(ok_sl_rev, "F 止损后反向 3/3 可跳过冷却")
+# 状态持久化：last_close_side 进 state.json，恢复后规则还在
+_st = risk_f.state_dict()
+risk_f3 = RiskManager(["ETHUSDT"])
+risk_f3.restore_state(_st)
+ok_restored, _ = risk_f3.can_trade("ETHUSDT", now=_t0 + 5, votes=3, side="SHORT")
+check(not ok_restored, "F state.json 恢复后同方向冷却仍生效")
+
 # ---------- 模拟盘开关：config.json 明确关实盘 ----------
 cfg = json.loads((Path(__file__).resolve().parent.parent / "config.json").read_text(encoding="utf-8"))
 check(cfg.get("live_trading_enabled") is False, "E config.json 里 live_trading_enabled = false（模拟盘）")

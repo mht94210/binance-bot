@@ -84,6 +84,9 @@ class RiskManager:
         self.consecutive_losses: dict[str, int] = {s: 0 for s in self.symbols}
         self.last_close_at: dict[str, float | None] = {s: None for s in self.symbols}
         self.last_close_was_sl: dict[str, bool] = {s: False for s in self.symbols}
+        # 上一单平仓的方向（用户 2026-11-17 决定：刚平仓后同方向信号不能跳过冷却，
+        # 反向才可以；见 can_trade）
+        self.last_close_side: dict[str, str | None] = {s: None for s in self.symbols}
         self.pause_until: dict[str, float | None] = {s: None for s in self.symbols}
         # 全账户合起来算
         self.daily_loss_usdt = 0.0
@@ -110,6 +113,7 @@ class RiskManager:
             "daily_loss_limit": self.daily_loss_limit,
             "last_close_at": dict(self.last_close_at),
             "last_close_was_sl": dict(self.last_close_was_sl),
+            "last_close_side": dict(self.last_close_side),
             "pause_until": dict(self.pause_until),
         }
 
@@ -123,7 +127,7 @@ class RiskManager:
         # 熔断线也恢复（收紧过的 50 U 不能因一次进程重启就悄悄变回 100 U）；
         # 旧 state.json 没有这个字段时默认 100 U。
         self.daily_loss_limit = float(saved.get("daily_loss_limit", MAX_DAILY_LOSS_USDT))
-        for key in ("last_close_at", "pause_until"):
+        for key in ("last_close_at", "last_close_side", "pause_until"):
             src = saved.get(key) or {}
             setattr(self, key, {s: src.get(s) for s in self.symbols})
         src = saved.get("last_close_was_sl") or {}
@@ -142,17 +146,21 @@ class RiskManager:
         self.daily_loss_limit = MAX_DAILY_LOSS_USDT  # 新的一天，熔断线恢复 100 U
         self.last_close_at = {s: None for s in self.symbols}
         self.last_close_was_sl = {s: False for s in self.symbols}
+        self.last_close_side = {s: None for s in self.symbols}
         self.pause_until = {s: None for s in self.symbols}
         return True
 
     # ---------- 当日上限 ----------
     def can_trade(self, symbol: str, now: float | None = None,
-                  votes: int = 0) -> tuple[bool, str]:
+                  votes: int = 0, side: str | None = None) -> tuple[bool, str]:
         """返回 (能不能开单, 原因)。原因空字符串表示可以开。
 
         冷却例外（2026-11-11 用户决定）：3/3 强信号可跳过冷却直接进场，
         2/3 票的信号继续等满冷却。连亏暂停、消息禁入、每日熔断是硬刹车，
         再强的信号也不能跳过。
+        同方向例外（2026-11-17 用户决定：刚平仓不要立马又开同一方向）：
+        冷却期内，3/3 信号只有在方向和上一单平仓方向相反时才能跳过冷却；
+        同方向（比如刚平了空单又来空单）3/3 也不跳过，等满冷却再说。
         """
         if self.trades_today.get(symbol, 0) >= MAX_TRADES_PER_DAY:
             return False, f"{symbol} 今日已开 {self.trades_today.get(symbol, 0)} 单，达到上限 {MAX_TRADES_PER_DAY} 单。"
@@ -174,6 +182,9 @@ class RiskManager:
                 left = int((need - (now - last_close)) / 60) + 1
                 kind = "止损后" if was_sl else "平仓后"
                 if votes >= 3:
+                    last_side = self.last_close_side.get(symbol)
+                    if side is not None and last_side is not None and side == last_side:
+                        return False, f"{symbol} {kind}冷却中（刚平的同方向 {side}，还要等约 {left} 分钟，3/3 也不跳过）。"
                     return True, f"3/3 强信号，跳过{symbol} {kind}冷却（本来还要等约 {left} 分钟）。"
                 return False, f"{symbol} {kind}冷却中，还要等约 {left} 分钟。"
         return True, ""
@@ -184,8 +195,10 @@ class RiskManager:
     def record_trade_opened(self, symbol: str, now: float | None = None) -> None:
         self.trades_today[symbol] = self.trades_today.get(symbol, 0) + 1
 
-    def record_trade_closed(self, symbol: str, pnl_usdt: float, was_sl: bool, now: float | None = None) -> None:
-        """平仓后调用：更新当日盈亏（全账户）、连亏计数和冷却时间（按币种）。"""
+    def record_trade_closed(self, symbol: str, pnl_usdt: float, was_sl: bool, now: float | None = None,
+                            side: str | None = None) -> None:
+        """平仓后调用：更新当日盈亏（全账户）、连亏计数和冷却时间（按币种）。
+        side 是这单的方向（LONG/SHORT），用来判断下一单是不是同方向（见 can_trade）。"""
         self.daily_pnl_usdt += pnl_usdt
         if pnl_usdt < 0:
             self.daily_loss_usdt += -pnl_usdt
@@ -195,6 +208,8 @@ class RiskManager:
         if now is not None:
             self.last_close_at[symbol] = now
             self.last_close_was_sl[symbol] = was_sl
+            if side is not None:
+                self.last_close_side[symbol] = side
             if self.consecutive_losses.get(symbol, 0) >= MAX_CONSECUTIVE_LOSSES:
                 self.pause_until[symbol] = now + CONSECUTIVE_LOSS_PAUSE_MINUTES * 60
 
