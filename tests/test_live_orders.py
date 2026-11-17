@@ -613,6 +613,154 @@ def test_stop_after_breakeven_is_breakeven_exit():
         restore_gate(saved)
 
 
+# ---------- 现价穿保护价兜底（2026-11-17 自检：L4 事故回归）----------
+def test_sl_crossed_but_not_filled_market_closes():
+    """L4 复现：BTC SHORT 止损 70600 被现价穿到 70700，但交易所止损单没成交，
+    机器人必须立刻市价平仓，不能像 L4 那样只记心跳干等。"""
+    saved = save_gate()
+    try:
+        enable_live_gate()
+        client, trader = make_trader(auto_fill_entry=True)
+        pos = open_short(trader)
+        risk = RiskManager(["BTCUSDT", "ETHUSDT"])
+        positions = {"BTCUSDT": pos, "ETHUSDT": None}
+        hb = {"BTCUSDT": 0.0, "ETHUSDT": 0.0}
+        # 止损单故意不成交（模拟交易所没触发）
+        manage_live_position("BTCUSDT", pos, 70700.0, time.time(), risk, trader,
+                             lambda: None, positions, hb)
+        check(positions["BTCUSDT"] is None, "现价穿止损但交易所单未成交：清持仓")
+        check(len(client.market_closes) == 1, "现价穿止损但交易所单未成交：市价平仓一次")
+        check(client.positions["BTCUSDT"] == 0.0, "兜底平仓后交易所无持仓")
+        check(abs(risk.daily_pnl_usdt - (-14.04)) < 0.01,
+              f"穿止损兜底盈亏计入当日（实得 {risk.daily_pnl_usdt:.2f}，预期 -14.04）")
+        check(risk.last_close_was_sl["BTCUSDT"] is True, "穿止损兜底记为 was_sl")
+        check(client.orders[pos["tp_order_id"]]["status"] == "CANCELED",
+              "兜底平仓后撤掉止盈单")
+        check(any("已穿止损" in m for m in LOGS), "穿止损兜底记了严重日志")
+    finally:
+        restore_gate(saved)
+
+
+def test_tp_crossed_but_not_filled_market_closes():
+    """现价穿到止盈 69100 之下，但交易所止盈单没成交，同样立刻市价平仓。"""
+    saved = save_gate()
+    try:
+        enable_live_gate()
+        client, trader = make_trader(auto_fill_entry=True)
+        pos = open_short(trader)
+        risk = RiskManager(["BTCUSDT", "ETHUSDT"])
+        positions = {"BTCUSDT": pos, "ETHUSDT": None}
+        hb = {"BTCUSDT": 0.0, "ETHUSDT": 0.0}
+        manage_live_position("BTCUSDT", pos, 69000.0, time.time(), risk, trader,
+                             lambda: None, positions, hb)
+        check(positions["BTCUSDT"] is None, "现价穿止盈但交易所单未成交：清持仓")
+        check(len(client.market_closes) == 1, "现价穿止盈但交易所单未成交：市价平仓一次")
+        check(abs(risk.daily_pnl_usdt - 19.96) < 0.01,
+              f"穿止盈兜底盈亏计入当日（实得 {risk.daily_pnl_usdt:.2f}，预期 19.96）")
+        check(risk.last_close_was_sl["BTCUSDT"] is False, "穿止盈兜底不算止损")
+        check(any("已穿止盈" in m for m in LOGS), "穿止盈兜底记了严重日志")
+        check(any("平仓 [止盈]" in m for m in LOGS), "穿止盈兜底记了平仓日志")
+    finally:
+        restore_gate(saved)
+
+
+def test_sl_crossed_algo_routing_market_closes():
+    """新版库（algo 止损单）同样：algo 止损没触发、现价已穿止损，市价平仓兜底。"""
+    saved = save_gate()
+    try:
+        enable_live_gate()
+        client, trader = make_trader(auto_fill_entry=True)
+        client.algo_routing = True
+        pos = open_short(trader)
+        risk = RiskManager(["BTCUSDT", "ETHUSDT"])
+        positions = {"BTCUSDT": pos, "ETHUSDT": None}
+        hb = {"BTCUSDT": 0.0, "ETHUSDT": 0.0}
+        manage_live_position("BTCUSDT", pos, 70700.0, time.time(), risk, trader,
+                             lambda: None, positions, hb)
+        check(positions["BTCUSDT"] is None, "algo 回归：现价穿止损未成交，清持仓")
+        check(len(client.market_closes) == 1, "algo 回归：现价穿止损未成交，市价平仓一次")
+        check(abs(risk.daily_pnl_usdt - (-14.04)) < 0.01,
+              f"algo 回归：穿止损兜底盈亏计入当日（实得 {risk.daily_pnl_usdt:.2f}，预期 -14.04）")
+        check(client.algo_orders[pos["sl_order_id"]]["algoStatus"] == "CANCELED",
+              "algo 回归：兜底平仓后撤掉残留 algo 止损单")
+    finally:
+        restore_gate(saved)
+
+
+def test_cancelled_sl_is_replaced():
+    """保护单存活检查：algo 止损被人撤了（L3 事故的同款），现价还没穿止损时
+    按原价重挂，不平仓、不留裸仓。"""
+    saved = save_gate()
+    try:
+        enable_live_gate()
+        client, trader = make_trader(auto_fill_entry=True)
+        client.algo_routing = True
+        pos = open_short(trader)
+        risk = RiskManager(["BTCUSDT", "ETHUSDT"])
+        positions = {"BTCUSDT": pos, "ETHUSDT": None}
+        hb = {"BTCUSDT": 0.0, "ETHUSDT": 0.0}
+        old_sl = pos["sl_order_id"]
+        client.futures_cancel_algo_order("BTCUSDT", old_sl)
+        manage_live_position("BTCUSDT", pos, 70000.0, time.time(), risk, trader,
+                             lambda: None, positions, hb)
+        check(positions["BTCUSDT"] is pos, "止损被撤但现价未穿：持仓还在")
+        check(len(client.market_closes) == 0, "止损被撤但现价未穿：不市价平仓")
+        check(pos["sl_order_id"] != old_sl, "止损被撤：重挂了新止损单")
+        check(client.algo_orders[pos["sl_order_id"]]["algoStatus"] == "NEW",
+              "止损被撤：新止损单在交易所挂着")
+        check(abs(float(client.algo_orders[pos["sl_order_id"]]["triggerPrice"]) - 70600.0) < 1e-9,
+              "止损被撤：新止损挂在原价 70600")
+        check(any("已不在交易所" in m for m in LOGS), "止损被撤记了严重日志")
+    finally:
+        restore_gate(saved)
+
+
+def test_cancelled_tp_is_replaced():
+    """保护单存活检查：止盈限价单被人撤了，现价还没穿止盈时按原价重挂。"""
+    saved = save_gate()
+    try:
+        enable_live_gate()
+        client, trader = make_trader(auto_fill_entry=True)
+        pos = open_short(trader)
+        risk = RiskManager(["BTCUSDT", "ETHUSDT"])
+        positions = {"BTCUSDT": pos, "ETHUSDT": None}
+        hb = {"BTCUSDT": 0.0, "ETHUSDT": 0.0}
+        old_tp = pos["tp_order_id"]
+        client.futures_cancel_order("BTCUSDT", old_tp)
+        manage_live_position("BTCUSDT", pos, 70000.0, time.time(), risk, trader,
+                             lambda: None, positions, hb)
+        check(positions["BTCUSDT"] is pos, "止盈被撤但现价未穿：持仓还在")
+        check(len(client.market_closes) == 0, "止盈被撤但现价未穿：不市价平仓")
+        check(pos["tp_order_id"] != old_tp, "止盈被撤：重挂了新止盈单")
+        check(abs(float(client.orders[pos["tp_order_id"]]["price"]) - 69100.0) < 1e-9,
+              "止盈被撤：新止盈挂在原价 69100")
+    finally:
+        restore_gate(saved)
+
+
+def test_sl_replace_failure_market_closes():
+    """保护单存活检查：止损丢了、重挂又失败，立刻市价平仓，绝不留裸仓。"""
+    saved = save_gate()
+    try:
+        enable_live_gate()
+        client, trader = make_trader(auto_fill_entry=True)
+        client.algo_routing = True
+        pos = open_short(trader)
+        risk = RiskManager(["BTCUSDT", "ETHUSDT"])
+        positions = {"BTCUSDT": pos, "ETHUSDT": None}
+        hb = {"BTCUSDT": 0.0, "ETHUSDT": 0.0}
+        client.futures_cancel_algo_order("BTCUSDT", pos["sl_order_id"])
+        client.fail_create = FakeBinanceAPIException(-2010, "Order would immediately trigger.")
+        manage_live_position("BTCUSDT", pos, 70000.0, time.time(), risk, trader,
+                             lambda: None, positions, hb)
+        check(positions["BTCUSDT"] is None, "止损重挂失败：清持仓")
+        check(len(client.market_closes) == 1, "止损重挂失败：市价平仓一次")
+        check(client.positions["BTCUSDT"] == 0.0, "止损重挂失败平仓后交易所无持仓")
+        check(any("重挂失败" in m for m in LOGS), "止损重挂失败记了严重日志")
+    finally:
+        restore_gate(saved)
+
+
 def test_live_close_pnl_math():
     short = {"side": "SHORT", "entry": 70000.0, "qty": 0.02}
     check(abs(live_close_pnl(short, 69100.0, 0.04) - 17.96) < 1e-9,
@@ -1178,6 +1326,12 @@ if __name__ == "__main__":
     test_stop_loss_detected()
     test_breakeven_moves_stop()
     test_stop_after_breakeven_is_breakeven_exit()
+    test_sl_crossed_but_not_filled_market_closes()
+    test_tp_crossed_but_not_filled_market_closes()
+    test_sl_crossed_algo_routing_market_closes()
+    test_cancelled_sl_is_replaced()
+    test_cancelled_tp_is_replaced()
+    test_sl_replace_failure_market_closes()
     test_live_close_pnl_math()
     test_fetch_fees_failure_returns_none()
     test_rounding()
