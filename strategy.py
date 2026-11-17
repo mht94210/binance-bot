@@ -1,39 +1,27 @@
 """
 10 倍快进快出策略（纯函数，不碰 API，方便单测）。
 
-版本：2026-11-10 用户确认（综合 3Commas / Cryptohopper / Pionex / Freqtrade 等做法后定）。
-2026-11-11 用户决定改成少而精：信号 15 分钟，3/3 全票，ADX>25，加 4 小时趋势过滤，保证金 400 U/单。
-2026-11-16 用户决定：去掉 EMA50 方向过滤——短线看波动选方向，不再只顺大趋势做。
-反弹本身就是机会：跌多了出现做多信号就做多吃反弹，反弹到压力位上不去再做空。
-2026-11-16 用户决定（解决进场晚）：去掉 ADX 门槛 + 实时信号——不再等 15 分钟 K 线
-收盘，每 60 秒用当前未收盘的 K 线判断一次，3/3 票就进，多空来回做。
-2026-11-16 用户决定（保留全部策略，按大趋势智能调配）：三种模式共用风控，只换开单规则，
-模式由 1 小时 ADX 决定——>=25 强趋势用 trend（原 6 胜策略：EMA50 方向过滤 + ADX 门槛，
-前两天大跌时能用上），15~25 过渡用 momentum（当前动量策略），<15 震荡用 range（反转策略，
-只在 6 小时区间下 1/4 做多、上 1/4 做空）。
-- 信号：实时判断（当前未收盘的 15 分钟 K 线，每 60 秒一次）；均线方向、分界线、
-  量能三项必须全中（3/3 全票），多空由 15 分钟波动决定（均线/分界线/量能）；
-  止盈目标 < 0.30% 不做；冷却与额度由风控器管。
-- 过度延伸过滤（2026-11-16 用户决定）：做空时现价比 6 小时高点跌超 3 倍 ATR
-  就不追空，做多时现价比 6 小时低点涨超 3 倍 ATR 就不追多——信号打在反转点
-  是因为跌得越狠信号越强，过度延伸就是衰竭。
-- 止损止盈：按 15 分钟 ATR 算。止损 2 倍 ATR，止盈 3 倍 ATR，盈亏比 1:1.5。
-- 手续费地板：止盈目标 < 0.30% 不做（手续费就把利润吃掉了）。
-- 保本和出场由 main.py 管：赚到 1 倍风险就把止损移到成本价。
+【剥头皮测试版 2026-11-17，用户决定：先做模拟盘版本测几天，放日本服务器跑】
+进场规则和德国实盘版完全一样（三模式按 1 小时 ADX 调配，实时信号，3/3 全票）；
+只改出场：
+- 止损 3 倍 ATR（放远了，不会被噪音突然打掉；实盘版是 2 倍）
+- 止盈不再按 ATR：浮盈扣掉全部手续费，净赚 1U 就平（止盈价按仓位反推，见 risk.scalp_tp_price）
+- 手续费地板不启用：止盈本身就是净赚 1U（已扣费），不可能被手续费吃掉。
+- 保本和出场由 main.py 管：赚到 1 倍风险就把止损移到成本价（止盈只有约 1.35U 毛利，
+  远没到 1 倍风险 10U，保本实际触发不了，留着也不碍事）。
 
 入场按 Post Only 限价单（maker 手续费），止损按市价单；Dry-Run 下按信号价成交。
 """
 from config import (
     EMA_TREND_PERIOD,
-    FEE_FLOOR_PCT,
     OVEREXTENSION_ATR_MULT,
     RANGE_EDGE_FRACTION,
     REGIME_ADX_RANGE,
     REGIME_ADX_TREND,
     SL_ATR_MULT,
-    TP_ATR_MULT,
     TREND_ADX_MIN,
 )
+from risk import position_qty, scalp_tp_price
 
 
 def select_mode(adx1h: float | None) -> str:
@@ -106,7 +94,7 @@ def evaluate(price: float, atr: float | None,
       再加过度延伸过滤（跌多了不追空、涨多了不追多）。
     - range（反转策略）：3/3 票 + 位置确认——只在 6 小时区间下 1/4 做多、上 1/4
       做空；再加过度延伸过滤。
-    共通：手续费地板（止盈目标 < 0.30% 不做）；冷却与额度由风控器管，不在这里判断。
+    共通：止盈按净赚 1U 算（已扣费，不用手续费地板）；冷却与额度由风控器管，不在这里判断。
     """
     def _blocked(reason: str):
         if log is not None:
@@ -120,13 +108,9 @@ def evaluate(price: float, atr: float | None,
     if ma_fast is None or ma_slow is None:
         return _blocked("15 分钟均线还没算出来，等预热。")
 
-    # 手续费地板：止盈目标 < 0.30% 不做
-    tp_pct = TP_ATR_MULT * atr / price
-    if tp_pct < FEE_FLOOR_PCT:
-        return _blocked(f"止盈目标只有 {tp_pct*100:.2f}%，低于手续费地板 0.30%，不做。")
-
+    # 剥头皮版没有手续费地板：止盈价是按仓位反推的净赚 1U（已扣进场 maker + 出场 maker
+    # 手续费），本身就不可能被手续费吃掉；ATR 再小也不挡信号。
     stop_distance = SL_ATR_MULT * atr
-    take_distance = TP_ATR_MULT * atr
 
     votes_long = _votes_long(price, ma_fast, ma_slow, midline, volume, volume_sma)
     votes_short = _votes_short(price, ma_fast, ma_slow, midline, volume, volume_sma)
@@ -174,31 +158,39 @@ def evaluate(price: float, atr: float | None,
                                 f"（{rise / atr:.1f} 倍 ATR），不追多。")
 
     if votes_long == 3:
+        qty = position_qty(price, price - stop_distance)
+        if qty <= 0:
+            return _blocked("仓位算出来是 0，不做。")
+        tp = scalp_tp_price(price, "LONG", qty)
         return {
             "side": "LONG",
             "entry": price,
             "stop_loss": price - stop_distance,
-            "take_profit": price + take_distance,
-            "take_profit_1": price + take_distance,
+            "take_profit": tp,
+            "take_profit_1": tp,
             "take_profit_2": None,
             "atr": atr,
             "votes": votes_long,
             "reason": f"{mode_label}做多 {votes_long}/3 票（15m 均线多头），"
-                      f"止损 {stop_distance:.0f} 点，止盈 {take_distance:.0f} 点",
+                      f"止损 {stop_distance:.0f} 点，止盈净赚 1U（约 {tp - price:.0f} 点）",
             "mode": mode,
         }
     if votes_short == 3:
+        qty = position_qty(price, price + stop_distance)
+        if qty <= 0:
+            return _blocked("仓位算出来是 0，不做。")
+        tp = scalp_tp_price(price, "SHORT", qty)
         return {
             "side": "SHORT",
             "entry": price,
             "stop_loss": price + stop_distance,
-            "take_profit": price - take_distance,
-            "take_profit_1": price - take_distance,
+            "take_profit": tp,
+            "take_profit_1": tp,
             "take_profit_2": None,
             "atr": atr,
             "votes": votes_short,
             "reason": f"{mode_label}做空 {votes_short}/3 票（15m 均线空头），"
-                      f"止损 {stop_distance:.0f} 点，止盈 {take_distance:.0f} 点",
+                      f"止损 {stop_distance:.0f} 点，止盈净赚 1U（约 {price - tp:.0f} 点）",
             "mode": mode,
         }
     return _blocked(f"共振不足：做多 {votes_long}/3 票、做空 {votes_short}/3 票（均线/分界线/量能），要 3 票全中。")

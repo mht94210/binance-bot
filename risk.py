@@ -20,6 +20,7 @@ from config import (
     MAX_TRADES_PER_DAY,
     NEWS_PAUSE_WINDOWS,
     RISK_PER_TRADE_PCT,
+    SCALP_NET_TP_USDT,
     TAKER_FEE_PCT,
 )
 
@@ -45,6 +46,38 @@ def is_news_pause(now: float) -> bool:
         if start_ts <= now <= end_ts:
             return True
     return False
+
+
+def position_qty(entry: float, stop_loss: float) -> float:
+    """按风险倒推数量（和 size_position 同一套算法，不含亏损上限检查）：
+    名义仓位 = 每单风险额 / 止损距离%，保证金按 400U 封顶。strategy.py 算剥头皮
+    止盈价时也要用同一个数量，单点来源，免得两边算出来对不上。"""
+    stop_distance = abs(entry - stop_loss)
+    if stop_distance <= 0 or entry <= 0:
+        return 0.0
+    risk_amount = ACCOUNT_SIZE_USDT * RISK_PER_TRADE_PCT
+    stop_pct = stop_distance / entry
+    notional = risk_amount / stop_pct if stop_pct > 0 else 0.0
+    margin = notional / LEVERAGE
+    if margin > MAX_MARGIN_PER_TRADE_USDT:
+        margin = MAX_MARGIN_PER_TRADE_USDT
+        notional = margin * LEVERAGE
+    return notional / entry
+
+
+def scalp_tp_price(entry: float, side: str, qty: float) -> float:
+    """剥头皮止盈价：出场净赚正好 SCALP_NET_TP_USDT（已扣进场 maker + 出场 maker 手续费）。
+    净盈亏 = 数量×|止盈-入场| - 入场费 - 出场费 = 1U，解出止盈价。
+    做多：TP = (1 + qty×entry×(1+m)) / (qty×(1-m))；
+    做空：TP = (qty×entry×(1-m) - 1) / (qty×(1+m))，m = MAKER_FEE_PCT。
+    注意：止盈出场按 maker 限价单算（和 close_pnl 里 exit_is_maker=True 一致）；
+    止损出场是市价单，按 taker 算，不走这个函数。"""
+    m = MAKER_FEE_PCT
+    if qty <= 0 or entry <= 0:
+        return 0.0
+    if side == "LONG":
+        return (SCALP_NET_TP_USDT + qty * entry * (1 + m)) / (qty * (1 - m))
+    return (qty * entry * (1 - m) - SCALP_NET_TP_USDT) / (qty * (1 + m))
 
 
 class RiskManager:
@@ -175,21 +208,15 @@ class RiskManager:
         按风险倒推仓位：名义仓位 = 每单风险额 / 止损距离%，保证金按 MAX_MARGIN_PER_TRADE_USDT 封顶。
         每单风险额 = 本金 x 0.5%（10 U）。返回 (数量, 保证金 USDT, 预期最大亏损 USDT)。
         预期最大亏损按 Taker 手续费保守估算；超 40 U 硬上限返回数量 0，放弃这单。
+        数量算法和模块函数 position_qty 是同一份（这里直接调它，免得两边改漏）。
         """
         stop_distance = abs(entry - stop_loss)
         if stop_distance <= 0 or entry <= 0:
             return 0.0, 0.0, 0.0
 
-        risk_amount = ACCOUNT_SIZE_USDT * RISK_PER_TRADE_PCT
-        stop_pct = stop_distance / entry
-        notional = risk_amount / stop_pct if stop_pct > 0 else 0.0
+        qty = position_qty(entry, stop_loss)
+        notional = qty * entry
         margin = notional / LEVERAGE
-
-        # 保证金超上限：按 MAX_MARGIN_PER_TRADE_USDT 封顶倒推数量
-        if margin > MAX_MARGIN_PER_TRADE_USDT:
-            margin = MAX_MARGIN_PER_TRADE_USDT
-            notional = margin * LEVERAGE
-        qty = notional / entry
 
         # 预期最大亏损 = 止损距离的亏损 + 一进一出手续费（保守按 Taker 算）
         max_loss = qty * stop_distance + notional * (MAKER_FEE_PCT + TAKER_FEE_PCT)
