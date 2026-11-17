@@ -14,9 +14,6 @@ Binance BTC+ETH 永续合约短线机器人 —— 10 倍快进快出方案（�
   本仓库不含任何真实 Key、Secret、账号、密码。
 - 实盘持仓以交易所为准：止盈止损挂在交易所，轮询订单状态判断成交，
   不再用 ticker 价模拟成交；挂保护失败立刻市价平仓，绝不留裸仓。
-  另外两道兜底（2026-11-17 自检，L4 事故）：现价穿了止损/止盈但交易所
-  保护单没成交，立刻市价平仓；保护单被人撤了/过期了，每 20 秒随心跳查一次，
-  丢了就按原价重挂，重挂不上也市价平仓。
   启动时拉一次交易所持仓对账，孤儿持仓绝不能丢；启动对账拉不到状态的币种
   主循环每 15 分钟重试一次，成功自动解除暂停（2026-11-15 的教训：一次瞬时失败
   不能永久堵死一个币种）。
@@ -590,37 +587,6 @@ class LiveTrader:
                 "exit_price": float(order.get("avgPrice") or 0) or None,
                 "exit_order_id": sl_id}
 
-    def exit_order_status(self, symbol: str, kind: str, oid: int) -> str | None:
-        """查一条止盈/止损保护单的当前状态（归一化大写），供持仓轮询做存活检查：
-        - "CANCELED"/"EXPIRED"/"REJECTED"：单子明确没了，调用方按原价重挂；
-        - "GONE"：algo 和普通查询都报 -2013（查无此单），同样当没了处理；
-        - 其它状态（NEW / TRIGGERED / FILLED 等）照实返回；
-        - 查失败返回 None（查失败不等于单子没了，调用方不动作，下轮再查）。
-        SL 是 algo 单：先走 algo 查询，-2013 再回落普通查单；TP 是普通单。
-        本方法永不抛错。"""
-        try:
-            if kind == "SL":
-                get_algo = getattr(self.client, "futures_get_algo_order", None)
-                if get_algo is not None:
-                    try:
-                        res = get_algo(symbol=symbol, algoId=oid, recvWindow=RECV_WINDOW_MS)
-                        return str(res.get("algoStatus") or "").upper() or None
-                    except Exception as e:  # noqa: BLE001 - 只有 -2013 才回落，其它错误当查失败
-                        if getattr(e, "code", None) != -2013:
-                            return None
-                try:
-                    order = self.client.futures_get_order(symbol=symbol, orderId=oid, recvWindow=RECV_WINDOW_MS)
-                except Exception as e:  # noqa: BLE001
-                    return "GONE" if getattr(e, "code", None) == -2013 else None
-                return str(order.get("status") or "").upper() or None
-            try:
-                order = self.client.futures_get_order(symbol=symbol, orderId=oid, recvWindow=RECV_WINDOW_MS)
-            except Exception as e:  # noqa: BLE001
-                return "GONE" if getattr(e, "code", None) == -2013 else None
-            return str(order.get("status") or "").upper() or None
-        except Exception:  # noqa: BLE001 - 存活检查永不抛错
-            return None
-
     def cancel_algo_order(self, symbol: str, algo_id: int) -> None:
         """撤一个 algo 单（止损单）。新版库走 futures_cancel_algo_order；
         目标不是 algo 单（-2013，旧版库下的普通订单）：回落到普通撤单。"""
@@ -854,55 +820,9 @@ def manage_live_position(symbol: str, position: dict, price: float, now: float,
     """实盘持仓管理（持仓时每 5 秒一轮），以交易所订单状态为准：
     1. 查止盈/止损订单：成交了就按实际成交价算盈亏（手续费按交易所账单，拉不到用估算）、
        记风控、清持仓；2. 兜底：交易所持仓已为 0 但订单没显示成交（比如人工平了），
-       按现价平账并大声记一笔；3. 兜底：现价已穿止损/止盈但交易所保护单没成交
-       （单子丢了、被人工撤了、交易所没触发），立刻市价平仓——Dry-Run 分支本来就有
-       这道价穿检查，实盘分支只信交易所订单状态是漏掉的（2026-11-16 L4 事故：
-       BTC SHORT 止损 64527.9 被穿 9 小时仍未平仓，浮亏一度 -24.81U，远超计划
-       止损 -9.70U）；4. 保本：赚到 1 倍风险就通过交易所撤单重挂，把止损移到成本价；
-    5. 心跳：和 Dry-Run 同格式（监控脚本靠“持仓中”行报持仓），随心跳每 20 秒查一次
-       保护单还在不在交易所，丢了就按原价重挂，重挂不上也市价平仓，绝不留裸仓。
+       按现价平账并大声记一笔；3. 保本：赚到 1 倍风险就通过交易所撤单重挂，把止损移到成本价；
+    4. 心跳：和 Dry-Run 同格式（监控脚本靠“持仓中”行报持仓）。
     平仓后把 positions[symbol] 清掉；没平就原地不动。"""
-    def _force_market_close(kind: str, was_sl: bool, note: str) -> bool:
-        """现价穿保护价 / 保护单丢了重挂不上时，市价平仓兜底。成功返回 True
-        （已清持仓）；下单失败返回 False（持仓保留，调用方下轮再试）。
-        出场价按现价估算（市价单返回里没有成交均价），日志里写明是估算；
-        平完撤掉残留的保护单——止盈是限价单，双向模式下不带 reduceOnly，
-        不撤掉以后可能在止盈价反手开出新仓。"""
-        log(f"严重：{symbol} {note}，立刻市价平仓兜底。")
-        try:
-            exit_order = live_trader.market_close(symbol, position["side"], position["qty"])
-        except Exception as e:  # noqa: BLE001 - 兜底失败不杀主循环，下轮再试
-            log(f"严重：{symbol} 兜底市价平仓失败：{e}，下轮再试。")
-            return False
-        for _oid, _is_algo in ((position.get("tp_order_id"), False),
-                               (position.get("sl_order_id"), True)):
-            if not _oid:
-                continue
-            try:
-                if _is_algo:
-                    live_trader.cancel_algo_order(symbol, _oid)
-                else:
-                    live_trader.client.futures_cancel_order(
-                        symbol=symbol, orderId=_oid, recvWindow=RECV_WINDOW_MS)
-            except Exception:  # noqa: BLE001 - 残留单可能已成交/已撤，忽略
-                pass
-        exit_id = exit_order.get("orderId") if isinstance(exit_order, dict) else None
-        fees = live_trader.fetch_fees(
-            symbol, [position.get("entry_order_id"), exit_id],
-            start_time_ms=int(position["opened_at"] * 1000))
-        if fees is None:
-            pnl = close_pnl(position, price, exit_is_maker=(kind == "止盈"))
-            log(f"{symbol} 手续费按估算（交易所账单拉取失败）。")
-        else:
-            pnl = live_close_pnl(position, price, fees)
-        kind_label = "止盈" if kind == "止盈" else ("止损" if was_sl else "保本出场")
-        log(f"平仓 [{kind_label}]：{symbol} {position['side']} 入场 {position['entry']:.1f} 出场 {price:.1f}（现价估算），"
-            f"本单盈亏 {pnl:+.2f} U，今日累计 {risk.daily_pnl_usdt + pnl:+.2f} U。")
-        risk.record_trade_closed(symbol, pnl, was_sl=was_sl, now=now)
-        positions[symbol] = None
-        save_state()
-        return True
-
     try:
         res = live_trader.poll_exit_orders(symbol, position)
     except Exception as e:  # noqa: BLE001 - 查单失败不等于没成交，下轮再查
@@ -942,19 +862,6 @@ def manage_live_position(symbol: str, position: dict, price: float, now: float,
         positions[symbol] = None
         save_state()
         return
-    # 兜底：现价已穿止损/止盈——交易所保护单没成交（丢了、被人工撤了、没触发），
-    # 绝不能干等。止损/止盈价为 0（孤儿持仓还没重建好）时不触发，免得误杀。
-    side = position["side"]
-    sl = position["stop_loss"] or 0.0
-    tp = position["take_profit"] or 0.0
-    hit_sl = sl > 0 and ((side == "LONG" and price <= sl) or (side == "SHORT" and price >= sl))
-    hit_tp = tp > 0 and ((side == "LONG" and price >= tp) or (side == "SHORT" and price <= tp))
-    if hit_sl or hit_tp:
-        kind = "止损" if hit_sl else "止盈"
-        level = sl if hit_sl else tp
-        _force_market_close(kind, hit_sl and not position["breakeven_done"],
-                            f"现价 {price:.1f} 已穿{kind} {level:.1f}，但交易所{kind}单未成交")
-        return
     if not position["breakeven_done"]:
         entry = position["entry"]
         risk_distance = abs(entry - position["stop_loss"])
@@ -969,29 +876,6 @@ def manage_live_position(symbol: str, position: dict, price: float, now: float,
             else:
                 log(f"{symbol} 保本移动止损失败，下轮再试（原止损仍在）。")
     if now - last_heartbeat_log[symbol] >= HEARTBEAT_LOG_SECONDS:
-        # 保护单存活检查（随心跳每 20 秒查一次）：止损/止盈被人撤了、过期了，
-        # 立刻按原价重挂；重挂不上就市价平仓，绝不留裸仓。
-        # 只认明确的“没了”（CANCELED/EXPIRED/REJECTED，或两边都查无此单）；
-        # 查失败/状态不明不动作，下轮再查。
-        for _kind, _oid, _price in (("SL", position.get("sl_order_id"), position["stop_loss"]),
-                                    ("TP", position.get("tp_order_id"), position["take_profit"])):
-            if not _oid:
-                continue
-            _st = live_trader.exit_order_status(symbol, _kind, _oid)
-            if _st is None or _st not in ("CANCELED", "EXPIRED", "REJECTED", "GONE"):
-                continue
-            _label = "止损" if _kind == "SL" else "止盈"
-            log(f"严重：{symbol} {_label}单 {_oid} 已不在交易所（{_st}），按原价 {_price:.1f} 重挂。")
-            try:
-                if _kind == "SL":
-                    position["sl_order_id"] = live_trader.place_stop(symbol, position["side"], _price)
-                else:
-                    position["tp_order_id"] = live_trader.place_take_profit(
-                        symbol, position["side"], position["qty"], _price)
-                save_state()
-            except Exception as e:  # noqa: BLE001 - 重挂不上就市价平仓，绝不留裸仓
-                _force_market_close("止损", True, f"{_label}单丢了，重挂失败（{e}）")
-                return
         last_heartbeat_log[symbol] = now
         float_pnl = (price - position["entry"]) * position["qty"] if position["side"] == "LONG" \
             else (position["entry"] - price) * position["qty"]
