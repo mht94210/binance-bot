@@ -15,13 +15,13 @@
 从 15 提到 25，<25 全走震荡；震荡模式 2/3 票就开，止损 = 区间沿外 1.5 倍 ATR，
 止盈 = 对面沿；动量模式只剩 1h ADX 拿不到时的默认兜底。
 2026-11-18 用户决定（15 分钟信号反弹抓不住：均线翻得慢，等反弹确认又要等下一个 15 分钟，
-机会全错过）：信号周期改成 5 分钟；1h ADX 定模式、6 小时区间、止损止盈倍数、固定 200U、
+机会全错过）：信号周期改成 5 分钟；1h ADX 定模式、止损止盈倍数、固定 200U、
 冷却/熔断都不变。
 - 信号：实时判断（当前未收盘的 5 分钟 K 线，每 60 秒一次）；均线方向、分界线、
   量能三项必须全中（趋势/动量 3/3 全票，震荡 2/3 票），多空由 5 分钟波动决定（均线/分界线/量能）；
   止盈目标 < 0.30% 不做；冷却与额度由风控器管。
-- 过度延伸过滤（2026-11-16 用户决定）：做空时现价比 6 小时高点跌超 3 倍 ATR
-  就不追空，做多时现价比 6 小时低点涨超 3 倍 ATR 就不追多——信号打在反转点
+- 过度延伸过滤（2026-11-16 用户决定）：做空时现价比 2 小时高点跌超 3 倍 ATR
+  就不追空，做多时现价比 2 小时低点涨超 3 倍 ATR 就不追多——信号打在反转点
   是因为跌得越狠信号越强，过度延伸就是衰竭。
 - 止损止盈：趋势/动量按 5 分钟 ATR 算，止损 2 倍 ATR，止盈 3 倍 ATR，盈亏比 1:1.5；
   震荡按区间沿算，止损 = 沿外 1.5 倍 ATR，止盈 = 对面沿。
@@ -98,7 +98,7 @@ def evaluate(price: float, atr: float | None,
     实时判断：每 60 秒用当前未收盘的 5 分钟 K 线调用一次。price 是判断时的实时价
     （不是那根 K 线的收盘价，避免入场价滞后）；指标（ATR/ADX/均线/分界线/量能）
     按含当前未收盘 K 线的 5 分钟 K 线算（2026-11-16 用户决定，解决进场晚）。
-    range_high / range_low 是过去 6 小时区间的最高最低价（不传则不过度延伸过滤，
+    range_high / range_low 是过去 2 小时区间的最高最低价（不传则不过度延伸过滤，
     range 模式也做不了位置确认）。
     mode 是策略模式（select_mode 按 1 小时 ADX 选出）：trend / momentum / range。
     ema_trend 是 5 分钟 EMA50（只 trend 模式用）。
@@ -115,7 +115,7 @@ def evaluate(price: float, atr: float | None,
     - momentum（当前动量策略）：3/3 票就进，多空由 5 分钟波动决定，ADX 只参考；
       再加过度延伸过滤（跌多了不追空、涨多了不追多）。止损 2 倍 ATR、止盈 3 倍 ATR。
       2026-11-17 起只剩 1h ADX 拿不到时的默认兜底。
-    - range（反转策略）：2/3 票 + 位置确认——只在 6 小时区间下 1/4 做多、上 1/4
+    - range（反转策略）：2/3 票 + 位置确认——只在 2 小时区间下 1/4 做多、上 1/4
       做空；再加过度延伸过滤。止损 = 区间沿外 1.5 倍 ATR，止盈 = 对面沿。
     共通：手续费地板（止盈目标 < 0.30% 不做，按实际止盈距离算）；冷却与额度由风控器管，不在这里判断。
     """
@@ -151,15 +151,15 @@ def evaluate(price: float, atr: float | None,
             return _blocked("趋势模式：做空 3/3 票但现价在 EMA50 上方（逆势），不做。")
         mode_label = f"趋势模式（EMA50，5m ADX {adx15:.0f}>{TREND_ADX_MIN:.0f}）"
     elif mode == "range":
-        # 反转策略：位置确认——只在 6 小时区间下 1/4 做多、上 1/4 做空；2/3 票就开。
+        # 反转策略：位置确认——只在 2 小时区间下 1/4 做多、上 1/4 做空；2/3 票就开。
         if range_high is None or range_low is None:
-            return _blocked("反转模式：6 小时区间还没算出来，等预热。")
+            return _blocked("反转模式：2 小时区间还没算出来，等预热。")
         edge = RANGE_EDGE_FRACTION * (range_high - range_low)
         long_ok = votes_long >= required and price <= range_low + edge
         short_ok = votes_short >= required and price >= range_high - edge
         if not long_ok and not short_ok:
             if votes_long >= required or votes_short >= required:
-                return _blocked(f"反转模式：有 {max(votes_long, votes_short)}/3 票但现价不在 6 小时区间边缘"
+                return _blocked(f"反转模式：有 {max(votes_long, votes_short)}/3 票但现价不在 2 小时区间边缘"
                                 f"（离低点 {price - range_low:.0f} 点、离高点 {range_high - price:.0f} 点），不做。")
             return _blocked(f"反转模式：共振不足，做多 {votes_long}/3 票、做空 {votes_short}/3 票，"
                             f"要 {required} 票。")
@@ -169,7 +169,7 @@ def evaluate(price: float, atr: float | None,
             votes_long = 0
         if not short_ok:
             votes_short = 0
-        mode_label = "反转模式（6h 区间边缘）"
+        mode_label = "反转模式（2h 区间边缘）"
     else:  # momentum
         mode_label = f"动量模式（ADX {adx15:.0f} 仅参考）"
 
@@ -179,12 +179,12 @@ def evaluate(price: float, atr: float | None,
         if votes_short >= required and range_high is not None:
             drop = range_high - price
             if drop > OVEREXTENSION_ATR_MULT * atr:
-                return _blocked(f"跌多了不追空：现价比 6 小时高点跌了 {drop:.0f} 点"
+                return _blocked(f"跌多了不追空：现价比 2 小时高点跌了 {drop:.0f} 点"
                                 f"（{drop / atr:.1f} 倍 ATR），不追空。")
         if votes_long >= required and range_low is not None:
             rise = price - range_low
             if rise > OVEREXTENSION_ATR_MULT * atr:
-                return _blocked(f"涨多了不追多：现价比 6 小时低点涨了 {rise:.0f} 点"
+                return _blocked(f"涨多了不追多：现价比 2 小时低点涨了 {rise:.0f} 点"
                                 f"（{rise / atr:.1f} 倍 ATR），不追多。")
 
     # 止损止盈距离：趋势/动量按 2 倍 / 3 倍 ATR；反转按区间沿算——止损 = 沿外 1.5 倍 ATR，

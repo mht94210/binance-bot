@@ -23,9 +23,9 @@ Binance BTC+ETH 永续合约短线机器人 —— 10 倍快进快出方案（�
 - 三模式按 1 小时 ADX 智能调配（2026-11-16 用户决定，保留全部策略；2026-11-17 用户决定震荡上限
   从 15 提到 25，横盘让震荡接管）：>=25 强趋势用 trend
   （原 6 胜策略：EMA50 方向过滤 + 5m ADX>25 + 3/3 票）；<25 震荡用 range（反转：2/3 票 +
-  只在 6 小时区间下 1/4 做多、上 1/4 做空，止损沿外 1.5 倍 ATR，止盈到对面沿）；1h ADX 拿不到时
+  只在 2 小时区间下 1/4 做多、上 1/4 做空，止损沿外 1.5 倍 ATR，止盈到对面沿）；1h ADX 拿不到时
   默认 momentum（实时信号，5m 均线 3/3 全票，多空由 5 分钟波动决定，ADX 仅参考）；range 有过度延伸过滤
-  （离 6 小时极端点超 3 倍 ATR 不追），trend 模式不适用
+  （离 2 小时极端点超 3 倍 ATR 不追），trend 模式不适用
 - 信号：5 分钟 K 线实时判断（当前未收盘 K 线，每 60 秒一次），趋势/动量 3/3 全票，震荡 2/3 票
 - 趋势/动量止损 2 倍 ATR，止盈 3 倍 ATR，盈亏比 1:1.5；震荡止损沿外 1.5 倍 ATR，止盈到对面沿；
   止盈目标 < 0.30% 不做
@@ -194,7 +194,7 @@ def compute_indicators(symbol: str) -> dict | None:
     # 滚动分界线：最近 12 根 5 分钟 K 线（60 分钟）最高最低价的中点，跟着市场走
     recent = ksig[-MIDLINE_LOOKBACK_CANDLES:]
     midline = (max(k["high"] for k in recent) + min(k["low"] for k in recent)) / 2
-    # 6 小时区间高低点：过度延伸过滤用（跌多了不追空、涨多了不追多）
+    # 2 小时区间高低点：过度延伸过滤用（跌多了不追空、涨多了不追多）
     range_window = ksig[-RANGE_LOOKBACK_CANDLES:]
     range_high = max(k["high"] for k in range_window)
     range_low = min(k["low"] for k in range_window)
@@ -1093,9 +1093,9 @@ def main() -> None:
     log("BTC+ETH 合约短线机器人启动（10 倍快进快出方案，2026-11-10 用户确认；2026-11-11 加 ETH）")
     log(f"标的: {', '.join(SYMBOLS)} | Dry-Run: {DRY_RUN} | 实盘开关: {LIVE_TRADING_ENABLED} | 实盘已开: {live_trading_active()}")
     log("策略: 三模式按 1 小时 ADX 智能调配（>=25 强趋势用 trend 原 6 胜策略：EMA50 方向过滤 + 5m ADX>25；"
-        "<25 震荡用 range 反转策略：2/3 票 + 只在 6 小时区间下 1/4 做多、上 1/4 做空，止损沿外 1.5 倍 ATR，"
+        "<25 震荡用 range 反转策略：2/3 票 + 只在 2 小时区间下 1/4 做多、上 1/4 做空，止损沿外 1.5 倍 ATR，"
         "止盈到对面沿；1h ADX 拿不到时默认 momentum 动量策略：实时信号，5m 均线 3/3 全票，多空由 5 分钟波动决定，ADX 仅参考；"
-        "range 有过度延伸过滤：离 6 小时极端点超 3 倍 ATR 不追）+ 量能过滤；"
+        "range 有过度延伸过滤：离 2 小时极端点超 3 倍 ATR 不追）+ 量能过滤；"
         "趋势/动量止损 2 倍 ATR，止盈 3 倍 ATR，盈亏比 1:1.5；赚 1 倍风险保本；"
         "进场限价单，止损市价单；冷却 15 分钟（止损后 30 分钟，3/3 强信号可跳过）；"
         "每个币种一天最多 10 单、同时最多 1 单（全账户同时最多 2 单）")
