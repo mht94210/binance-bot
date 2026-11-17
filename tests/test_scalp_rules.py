@@ -1,9 +1,10 @@
 """剥头皮测试版规则回归（放在仓库里，虚拟机重启也不丢）。
 
-和德国实盘版的区别只有三处（用户 2026-11-17 决定：先做模拟盘版本测几天，放日本服务器跑）：
+和德国实盘版的区别只有四处（用户 2026-11-17 决定：先做模拟盘版本测几天，放日本服务器跑）：
 A) 止损 3 倍 ATR（放远了，不会被噪音突然打掉；实盘版是 2 倍）
 B) 止盈不再按 ATR：浮盈扣掉全部手续费，净赚 2U 就平（止盈价按仓位反推）
 C) 每天每币上限 50 单（用户目标一天 100 单；模拟盘测试，额度不做瓶颈）
+D) 每单固定 200U 保证金（用户 2026-11-17 决定；10 倍杠杆 = 2000U 名义仓位；仓位不再按风险倒推）
 其余照抄实盘版：三模式信号、3/3 全票、冷却、熔断、保本逻辑都不动。
 
 用法：python3 tests/test_scalp_rules.py
@@ -92,9 +93,10 @@ tp_formula = scalp_tp_price(64500.0, "LONG", 0.01375)
 check(abs(tp_formula - 64671.3) < 1.0, f"B 公式算做多止盈约 64671.3（算出 {tp_formula:.1f}）")
 tp_formula_s = scalp_tp_price(64500.0, "SHORT", 0.01375)
 check(abs(tp_formula_s - 64328.8) < 1.0, f"B 公式算做空止盈约 64328.8（算出 {tp_formula_s:.1f}）")
-# 止损出场是市价单（taker 费），一单净亏约 10.6U——宽止损的代价，写进测试免得以后有人偷偷改小
+# 止损出场是市价单（taker 费），固定 200U 保证金后一单净亏约 23.9U——
+# 仓位比风险倒推时大（BTC 0.031 对 0.0138），亏满也更大；写进测试免得以后有人偷偷改小
 pnl_sl = net_pnl_at("SHORT", sig_s["entry"], qty_s, sig_s["stop_loss"], False)
-check(-11.5 < pnl_sl < -10.0, f"B 止损出场净亏约 10.6U（算出 {pnl_sl:+.2f}U）")
+check(-25.0 < pnl_sl < -23.0, f"B 止损出场净亏约 23.9U（算出 {pnl_sl:+.2f}U）")
 
 # ---------- B2) 手续费地板不启用：ATR 再小也不挡信号 ----------
 sig_tiny = evaluate(**base_kwargs(atr=1.0))
@@ -103,13 +105,16 @@ check(sig_tiny is not None, "B2 ATR 只有 1 点也不挡信号（地板已取�
 # ---------- C) 每天每币上限 50 单 ----------
 check(MAX_TRADES_PER_DAY == 50, "C MAX_TRADES_PER_DAY = 50")
 
-# ---------- 仓位：按风险倒推，保证金封顶 400U ----------
+# ---------- D) 仓位：每单固定 200U 保证金（用户 2026-11-17 决定）----------
 risk = RiskManager(["BTCUSDT", "ETHUSDT"])
 qty, margin, max_loss = risk.size_position(64500.0, 64500.0 + 726.0)
-check(0 < margin < 400.0, f"C 3 倍 ATR 仓位保证金约 89U（算出 {margin:.1f}U）")
-check(max_loss < 40.0, f"C 预期最大亏损 < 40U 上限（算出 {max_loss:.2f}U）")
+check(margin == 200.0, f"D 3 倍 ATR 仓位保证金固定 200U（算出 {margin:.1f}U）")
+check(max_loss < 40.0, f"D 预期最大亏损 < 40U 上限（算出 {max_loss:.2f}U）")
 qty2, margin2, _ = risk.size_position(64500.0, 64490.0)
-check(margin2 == 400.0, f"C 止损很近时保证金封顶 400U（算出 {margin2:.1f}U）")
+check(margin2 == 200.0, f"D 止损很近时保证金仍是固定 200U，不再封顶（算出 {margin2:.1f}U）")
+qty3, margin3, _ = risk.size_position(1840.0, 1840.0 - 12.0)
+check(abs(margin3 - 200.0) < 0.01 and abs(qty3 - 2000.0 / 1840.0) < 1e-6,
+      f"D ETH 入场 1840 数量 = 2000/1840（算出 qty {qty3:.5f}，保证金 {margin3:.1f}U）")
 
 # ---------- 3/3 全票仍是硬门槛 ----------
 check(evaluate(**base_kwargs(volume=50.0)) is None, "D 2/3 票挡住（量能不足）")
