@@ -5,8 +5,8 @@
 进场规则和德国实盘版完全一样（三模式按 1 小时 ADX 调配，实时信号，3/3 全票）；
 只改出场：
 - 止损 3 倍 ATR（放远了，不会被噪音突然打掉；实盘版是 2 倍）
-- 止盈不再按 ATR：浮盈扣掉全部手续费，净赚 1U 就平（止盈价按仓位反推，见 risk.scalp_tp_price）
-- 手续费地板不启用：止盈本身就是净赚 1U（已扣费），不可能被手续费吃掉。
+- 止盈不再按 ATR：浮盈扣掉全部手续费，净赚 2U 就平（止盈价按仓位反推，见 risk.scalp_tp_price）
+- 手续费地板不启用：止盈本身就是净赚 2U（已扣费），不可能被手续费吃掉。
 - 保本和出场由 main.py 管：赚到 1 倍风险就把止损移到成本价（止盈只有约 1.35U 毛利，
   远没到 1 倍风险 10U，保本实际触发不了，留着也不碍事）。
 
@@ -94,7 +94,7 @@ def evaluate(price: float, atr: float | None,
       再加过度延伸过滤（跌多了不追空、涨多了不追多）。
     - range（反转策略）：3/3 票 + 位置确认——只在 6 小时区间下 1/4 做多、上 1/4
       做空；再加过度延伸过滤。
-    共通：止盈按净赚 1U 算（已扣费，不用手续费地板）；冷却与额度由风控器管，不在这里判断。
+    共通：止盈按净赚 2U 算（已扣费，不用手续费地板）；冷却与额度由风控器管，不在这里判断。
     """
     def _blocked(reason: str):
         if log is not None:
@@ -108,7 +108,7 @@ def evaluate(price: float, atr: float | None,
     if ma_fast is None or ma_slow is None:
         return _blocked("15 分钟均线还没算出来，等预热。")
 
-    # 剥头皮版没有手续费地板：止盈价是按仓位反推的净赚 1U（已扣进场 maker + 出场 maker
+    # 剥头皮版没有手续费地板：止盈价是按仓位反推的净赚 2U（已扣进场 maker + 出场 maker
     # 手续费），本身就不可能被手续费吃掉；ATR 再小也不挡信号。
     stop_distance = SL_ATR_MULT * atr
 
@@ -172,7 +172,7 @@ def evaluate(price: float, atr: float | None,
             "atr": atr,
             "votes": votes_long,
             "reason": f"{mode_label}做多 {votes_long}/3 票（15m 均线多头），"
-                      f"止损 {stop_distance:.0f} 点，止盈净赚 1U（约 {tp - price:.0f} 点）",
+                      f"止损 {stop_distance:.0f} 点，止盈净赚 2U（约 {tp - price:.0f} 点）",
             "mode": mode,
         }
     if votes_short == 3:
@@ -190,7 +190,7 @@ def evaluate(price: float, atr: float | None,
             "atr": atr,
             "votes": votes_short,
             "reason": f"{mode_label}做空 {votes_short}/3 票（15m 均线空头），"
-                      f"止损 {stop_distance:.0f} 点，止盈净赚 1U（约 {price - tp:.0f} 点）",
+                      f"止损 {stop_distance:.0f} 点，止盈净赚 2U（约 {price - tp:.0f} 点）",
             "mode": mode,
         }
     return _blocked(f"共振不足：做多 {votes_long}/3 票、做空 {votes_short}/3 票（均线/分界线/量能），要 3 票全中。")
