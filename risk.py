@@ -161,6 +161,9 @@ class RiskManager:
         同方向例外（2026-11-17 用户决定：刚平仓不要立马又开同一方向）：
         冷却期内，3/3 信号只有在方向和上一单平仓方向相反时才能跳过冷却；
         同方向（比如刚平了空单又来空单）3/3 也不跳过，等满冷却再说。
+        止损后反向例外（2026-11-17 用户决定：止损后反向有机会就直接进，
+        不要 30 分钟不动）：上一单是止损出的，反向信号不管 2 票还是 3 票，
+        都直接跳过 30 分钟冷却进场；同方向还是要等满 30 分钟。
         """
         if self.trades_today.get(symbol, 0) >= MAX_TRADES_PER_DAY:
             return False, f"{symbol} 今日已开 {self.trades_today.get(symbol, 0)} 单，达到上限 {MAX_TRADES_PER_DAY} 单。"
@@ -181,8 +184,12 @@ class RiskManager:
             if now - last_close < need:
                 left = int((need - (now - last_close)) / 60) + 1
                 kind = "止损后" if was_sl else "平仓后"
+                last_side = self.last_close_side.get(symbol)
+                is_reverse = (side is not None and last_side is not None
+                              and side != last_side)
+                if was_sl and is_reverse:
+                    return True, f"止损后反向信号，直接进场，跳过{symbol} {kind}冷却（本来还要等约 {left} 分钟）。"
                 if votes >= 3:
-                    last_side = self.last_close_side.get(symbol)
                     if side is not None and last_side is not None and side == last_side:
                         return False, f"{symbol} {kind}冷却中（刚平的同方向 {side}，还要等约 {left} 分钟，3/3 也不跳过）。"
                     return True, f"3/3 强信号，跳过{symbol} {kind}冷却（本来还要等约 {left} 分钟）。"

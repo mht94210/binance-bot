@@ -8,7 +8,7 @@ D) 每单固定 200U 保证金（用户 2026-11-17 决定；10 倍杠杆 = 2000U
 E) 简化信号（用户 2026-11-17 决定：均线定方向 + 2/3 票就开）：方向只看 5 分钟 MA5/MA20，
    三个投票（均线/分界线/量能）里 2 票就开；不要三模式、不要 ADX、不要 EMA50、
    不要过度延伸过滤（原来三模式 + 3/3 全票太严，200U 版上线 1 小时一单没开）
-其余照抄实盘版；冷却改过两次（2026-11-17 用户决定：同方向 3/3 不跳过冷却；平仓后冷却 15 分钟改 10 分钟），熔断、保本逻辑不动。
+其余照抄实盘版；冷却改过三次（2026-11-17 用户决定：同方向 3/3 不跳过冷却；平仓后冷却 15 分钟改 10 分钟；止损后反向直接进），熔断、保本逻辑不动。
 
 用法：python3 tests/test_scalp_rules.py
 """
@@ -136,6 +136,8 @@ check(evaluate(**base_kwargs()) is not None, "E 不用 ADX/EMA50/过度延伸过
 
 # ---------- F) 同方向冷却：刚平仓后同方向 3/3 也不跳过冷却，反向才跳过（用户 2026-11-17 决定）----------
 # 背景：J4 ETH 空单止盈后 5 秒，J5 又开了同方向空单（3/3 跳过了冷却）——用户要求同方向必须等满冷却。
+# 补充（用户 2026-11-17 决定）：止损后反向有机会就直接进，不要 30 分钟不动——
+# 上一单止损出的，反向信号 2 票 3 票都直接跳过冷却；止盈后反向 2 票还是要等冷却。
 _t0 = 1794906000.0  # 2026-11-17 09:00 UTC，不在大消息窗口里
 risk_f = RiskManager(["ETHUSDT"])
 risk_f.record_trade_closed("ETHUSDT", 3.02, was_sl=False, now=_t0, side="SHORT")
@@ -155,6 +157,14 @@ ok_sl, _ = risk_f2.can_trade("ETHUSDT", now=_t0 + 20 * 60, votes=3, side="SHORT"
 check(not ok_sl, "F 止损后 30 分钟冷却，同方向 3/3 在 20 分钟时仍挡住")
 ok_sl_rev, _ = risk_f2.can_trade("ETHUSDT", now=_t0 + 20 * 60, votes=3, side="LONG")
 check(ok_sl_rev, "F 止损后反向 3/3 可跳过冷却")
+# 止损后反向：2 票 3 票都直接进，不等 30 分钟；同方向还是要等满
+ok_sl_rev2, _ = risk_f2.can_trade("ETHUSDT", now=_t0 + 5 * 60, votes=2, side="LONG")
+check(ok_sl_rev2, "F 止损后反向 2/3 票也直接进（不等 30 分钟）")
+ok_sl_same2, _ = risk_f2.can_trade("ETHUSDT", now=_t0 + 5 * 60, votes=2, side="SHORT")
+check(not ok_sl_same2, "F 止损后同方向 2/3 票仍要等冷却")
+# 止盈后反向 2 票：还是要等冷却（直接进只适用于止损后反向）
+ok_tp_rev2, _ = risk_f.can_trade("ETHUSDT", now=_t0 + 5, votes=2, side="LONG")
+check(not ok_tp_rev2, "F 止盈后反向 2/3 票仍要等冷却")
 # 状态持久化：last_close_side 进 state.json，恢复后规则还在
 _st = risk_f.state_dict()
 risk_f3 = RiskManager(["ETHUSDT"])
