@@ -67,30 +67,30 @@ def _votes_short(price: float, ma_fast: float | None, ma_slow: float | None,
 
 
 def evaluate(price: float, atr: float | None,
-             adx15: float | None, ma_fast: float | None, ma_slow: float | None,
+             adx5: float | None, ma_fast: float | None, ma_slow: float | None,
              midline: float | None,
              volume: float | None, volume_sma: float | None,
              range_high: float | None = None, range_low: float | None = None,
              mode: str = "momentum", ema_trend: float | None = None,
              log=None) -> dict | None:
     """
-    实时判断：每 60 秒用当前未收盘的 15 分钟 K 线调用一次。price 是判断时的实时价
+    实时判断：每 60 秒用当前未收盘的 5 分钟 K 线调用一次。price 是判断时的实时价
     （不是那根 K 线的收盘价，避免入场价滞后）；指标（ATR/ADX/均线/分界线/量能）
-    按含当前未收盘 K 线的 15 分钟 K 线算（2026-11-16 用户决定，解决进场晚）。
+    按含当前未收盘 K 线的 5 分钟 K 线算（2026-11-16 用户决定，解决进场晚）。
     range_high / range_low 是过去 6 小时区间的最高最低价（不传则不过度延伸过滤，
     range 模式也做不了位置确认）。
     mode 是策略模式（select_mode 按 1 小时 ADX 选出）：trend / momentum / range。
-    ema_trend 是 15 分钟 EMA50（只 trend 模式用）。
+    ema_trend 是 5 分钟 EMA50（只 trend 模式用）。
     指标缺失（预热期）时直接返回 None，不过滤也不开单。
     返回信号 dict，或 None（无信号）。信号一定带 stop_loss 和 take_profit。
     被某道闸门挡住时，如传了 log 就记一条原因，方便查为什么没开单。
 
     三种模式（2026-11-16 用户决定：保留全部策略，按大趋势智能调配，共用风控，
     只换开单规则）：
-    - trend（原 6 胜策略思路）：15 分钟 ADX > 25 才做；方向必须顺 EMA50（现价在
+    - trend（原 6 胜策略思路）：5 分钟 ADX > 25 才做；方向必须顺 EMA50（现价在
       EMA50 上方只做多、下方只做空）；3/3 票。过度延伸过滤不适用（大趋势就是要追，
       过滤会把大跌里的空单全挡掉）。
-    - momentum（当前动量策略）：3/3 票就进，多空由 15 分钟波动决定，ADX 只参考；
+    - momentum（当前动量策略）：3/3 票就进，多空由 5 分钟波动决定，ADX 只参考；
       再加过度延伸过滤（跌多了不追空、涨多了不追多）。
     - range（反转策略）：3/3 票 + 位置确认——只在 6 小时区间下 1/4 做多、上 1/4
       做空；再加过度延伸过滤。
@@ -102,11 +102,11 @@ def evaluate(price: float, atr: float | None,
         return None
 
     if atr is None or atr <= 0:
-        return _blocked("ATR 还没算出来（15 分钟 K 线不够 15 根），等预热。")
-    if adx15 is None:
-        return _blocked("15 分钟 ADX 还没算出来，等预热。")
+        return _blocked("ATR 还没算出来（5 分钟 K 线不够 15 根），等预热。")
+    if adx5 is None:
+        return _blocked("5 分钟 ADX 还没算出来，等预热。")
     if ma_fast is None or ma_slow is None:
-        return _blocked("15 分钟均线还没算出来，等预热。")
+        return _blocked("5 分钟均线还没算出来，等预热。")
 
     # 剥头皮版没有手续费地板：止盈价是按仓位反推的净赚 2U（已扣进场 maker + 出场 maker
     # 手续费），本身就不可能被手续费吃掉；ATR 再小也不挡信号。
@@ -119,15 +119,15 @@ def evaluate(price: float, atr: float | None,
     if mode == "trend":
         # 原 6 胜策略：ADX 门槛 + EMA50 方向过滤；过度延伸过滤不适用（大趋势就是要追，
         # 过滤会把大跌里的空单全挡掉）。
-        if adx15 <= TREND_ADX_MIN:
-            return _blocked(f"趋势模式：15 分钟 ADX {adx15:.0f} 不到 {TREND_ADX_MIN:.0f}，不做。")
+        if adx5 <= TREND_ADX_MIN:
+            return _blocked(f"趋势模式：5 分钟 ADX {adx5:.0f} 不到 {TREND_ADX_MIN:.0f}，不做。")
         if ema_trend is None:
             return _blocked("趋势模式：EMA50 还没算出来，等预热。")
         if votes_long == 3 and price <= ema_trend:
             return _blocked("趋势模式：做多 3/3 票但现价在 EMA50 下方（逆势），不做。")
         if votes_short == 3 and price >= ema_trend:
             return _blocked("趋势模式：做空 3/3 票但现价在 EMA50 上方（逆势），不做。")
-        mode_label = f"趋势模式（EMA50，15m ADX {adx15:.0f}>{TREND_ADX_MIN:.0f}）"
+        mode_label = f"趋势模式（EMA50，5m ADX {adx5:.0f}>{TREND_ADX_MIN:.0f}）"
     elif mode == "range":
         # 反转策略：位置确认——只在 6 小时区间下 1/4 做多、上 1/4 做空。
         if range_high is None or range_low is None:
@@ -141,7 +141,7 @@ def evaluate(price: float, atr: float | None,
                             f"（离高点 {range_high - price:.0f} 点），不做。")
         mode_label = "反转模式（6h 区间边缘）"
     else:  # momentum
-        mode_label = f"动量模式（ADX {adx15:.0f} 仅参考）"
+        mode_label = f"动量模式（ADX {adx5:.0f} 仅参考）"
 
     # 过度延伸过滤（momentum / range 模式；trend 模式不适用——大趋势就是要追）：
     # 跌得越狠信号越强，但过度延伸就是衰竭——上一单信号价 64143.7 就是 10 小时最低点。
@@ -171,7 +171,7 @@ def evaluate(price: float, atr: float | None,
             "take_profit_2": None,
             "atr": atr,
             "votes": votes_long,
-            "reason": f"{mode_label}做多 {votes_long}/3 票（15m 均线多头），"
+            "reason": f"{mode_label}做多 {votes_long}/3 票（5m 均线多头），"
                       f"止损 {stop_distance:.0f} 点，止盈净赚 2U（约 {tp - price:.0f} 点）",
             "mode": mode,
         }
@@ -189,7 +189,7 @@ def evaluate(price: float, atr: float | None,
             "take_profit_2": None,
             "atr": atr,
             "votes": votes_short,
-            "reason": f"{mode_label}做空 {votes_short}/3 票（15m 均线空头），"
+            "reason": f"{mode_label}做空 {votes_short}/3 票（5m 均线空头），"
                       f"止损 {stop_distance:.0f} 点，止盈净赚 2U（约 {price - tp:.0f} 点）",
             "mode": mode,
         }

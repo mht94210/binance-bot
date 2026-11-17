@@ -48,8 +48,8 @@ MAX_CONSECUTIVE_LOSSES = 3            # 连亏 3 单
 CONSECUTIVE_LOSS_PAUSE_MINUTES = 60  # 连亏 3 单后休息 60 分钟
 
 # ---------- 信号与指标（写死）----------
-ATR_PERIOD = 14              # ATR 周期（15 分钟 K 线）
-ADX_PERIOD = 14              # ADX 周期（15 分钟 K 线；只作参考，不再设门槛）
+ATR_PERIOD = 14              # ATR 周期（5 分钟 K 线）
+ADX_PERIOD = 14              # ADX 周期（5 分钟 K 线；只作参考，不再设门槛）
 MA_FAST_PERIOD = 5           # 15 分钟快线
 MA_SLOW_PERIOD = 20          # 15 分钟慢线
 VOL_SMA_PERIOD = 20          # 量能均线周期（15 分钟）
@@ -67,7 +67,8 @@ BREAKEVEN_AT_R = 1.0         # 赚到 1 倍风险就把止损移到成本价（�
 # 代价：强趋势里也会挡掉一些好信号（趋势中价格同样会跌很多才出信号），
 # 阈值是起点，可调。
 OVEREXTENSION_ATR_MULT = 3.0  # 过度延伸阈值：离 6 小时极端点超过 3 倍 ATR 就不追
-RANGE_LOOKBACK_CANDLES = 24    # 6 小时区间 = 24 根 15 分钟 K 线
+SIGNAL_INTERVAL = "5m"        # 信号 K 线周期（用户 2026-11-17 决定改成 5 分钟：假信号也没啥，赚 2U 就走了）
+RANGE_LOOKBACK_CANDLES = 72    # 6 小时区间 = 72 根 5 分钟 K 线
 
 # ---------- 策略模式（2026-11-16 用户决定：保留全部策略，按大趋势智能调配）----------
 # 三种模式共用风控（止损止盈 2x/3x ATR、保本、冷却、额度），只换开单规则。
@@ -76,8 +77,8 @@ RANGE_LOOKBACK_CANDLES = 24    # 6 小时区间 = 24 根 15 分钟 K 线
 # （反转策略）。2026-11-16 晚 BTC/ETH 的 1h ADX 只有 5.0/10.6，都是 range。
 REGIME_ADX_TREND = 25.0   # 1h ADX >= 25：强趋势 -> trend 模式
 REGIME_ADX_RANGE = 15.0   # 1h ADX < 15：震荡 -> range 模式；15~25 之间 -> momentum 模式
-EMA_TREND_PERIOD = 50     # trend 模式的方向过滤均线（15 分钟 EMA50；用户 2026-11-15 嫌 EMA200 太慢改成 50）
-TREND_ADX_MIN = 25.0      # trend 模式的 ADX 门槛（15 分钟 ADX > 25 才做；用户 2026-11-16 从 30 降到 25）
+EMA_TREND_PERIOD = 50     # trend 模式的方向过滤均线（5 分钟 EMA50；用户 2026-11-15 嫌 EMA200 太慢改成 50）
+TREND_ADX_MIN = 25.0      # trend 模式的 ADX 门槛（5 分钟 ADX > 25 才做；用户 2026-11-16 从 30 降到 25）
 RANGE_EDGE_FRACTION = 0.25  # range 模式：只在 6 小时区间的下 1/4 做多、上 1/4 做空
 
 # ---------- 轮询间隔（2026-11-11 修止损滑点：20 秒太长，价格尖峰会穿过去）----------

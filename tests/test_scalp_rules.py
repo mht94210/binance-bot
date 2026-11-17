@@ -17,7 +17,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import (
     MAKER_FEE_PCT,
     MAX_TRADES_PER_DAY,
+    RANGE_LOOKBACK_CANDLES,
     SCALP_NET_TP_USDT,
+    SIGNAL_INTERVAL,
     SL_ATR_MULT,
     TAKER_FEE_PCT,
 )
@@ -35,9 +37,9 @@ def check(cond, label):
 
 
 def base_kwargs(**over):
-    # BTC 价位：价格 64500，15m ATR 242（约等于 L4 那单的水平）
+    # BTC 价位：价格 64500，5m ATR 242（测试用合成值；逻辑与 ATR 大小无关）
     kw = dict(price=64500.0, atr=242.0,
-              adx15=10.0, ma_fast=64400.0, ma_slow=64500.0, midline=64550.0,
+              adx5=10.0, ma_fast=64400.0, ma_slow=64500.0, midline=64550.0,
               volume=100.0, volume_sma=80.0)
     kw.update(over)
     return kw
@@ -53,6 +55,10 @@ def net_pnl_at(side, entry, qty, exit_price, exit_is_maker):
     pos = {"side": side, "entry": entry, "qty": qty}
     return close_pnl(pos, exit_price, exit_is_maker)
 
+
+# ---------- 0) 信号周期 5 分钟，6 小时区间 = 72 根 ----------
+check(SIGNAL_INTERVAL == "5m", "0 信号周期 5 分钟")
+check(RANGE_LOOKBACK_CANDLES == 72, "0 6 小时区间 = 72 根 5 分钟 K 线")
 
 # ---------- A) 止损 3 倍 ATR ----------
 sig_s = evaluate(**base_kwargs())
