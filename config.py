@@ -44,7 +44,7 @@ MAX_TRADES_PER_DAY = 50       # 剥头皮测试：每个币种一天最多 50 �
 MAX_OPEN_POSITIONS = 1        # 每个币种同时最多 1 单，不叠单
 
 # ---------- 冷却与熔断（写死）----------
-COOLDOWN_MINUTES = 15                 # 平仓后冷却 15 分钟
+COOLDOWN_MINUTES = 10                 # 平仓后冷却 10 分钟（用户 2026-11-17 决定：15 分钟改 10 分钟）
 COOLDOWN_AFTER_SL_MINUTES = 30        # 止损出场后冷却 30 分钟
 MAX_CONSECUTIVE_LOSSES = 3            # 连亏 3 单
 CONSECUTIVE_LOSS_PAUSE_MINUTES = 60  # 连亏 3 单后休息 60 分钟

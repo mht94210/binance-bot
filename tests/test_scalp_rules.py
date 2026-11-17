@@ -8,7 +8,7 @@ D) 每单固定 200U 保证金（用户 2026-11-17 决定；10 倍杠杆 = 2000U
 E) 简化信号（用户 2026-11-17 决定：均线定方向 + 2/3 票就开）：方向只看 5 分钟 MA5/MA20，
    三个投票（均线/分界线/量能）里 2 票就开；不要三模式、不要 ADX、不要 EMA50、
    不要过度延伸过滤（原来三模式 + 3/3 全票太严，200U 版上线 1 小时一单没开）
-其余照抄实盘版：冷却、熔断、保本逻辑都不动。
+其余照抄实盘版；冷却改过两次（2026-11-17 用户决定：同方向 3/3 不跳过冷却；平仓后冷却 15 分钟改 10 分钟），熔断、保本逻辑不动。
 
 用法：python3 tests/test_scalp_rules.py
 """
@@ -19,6 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import (
+    COOLDOWN_MINUTES,
     MAKER_FEE_PCT,
     MAX_TRADES_PER_DAY,
     SCALP_NET_TP_USDT,
@@ -144,8 +145,9 @@ ok_rev, _ = risk_f.can_trade("ETHUSDT", now=_t0 + 5, votes=3, side="LONG")
 check(ok_rev, "F 反向做多 3/3 可跳过冷却")
 ok_rev2, _ = risk_f.can_trade("ETHUSDT", now=_t0 + 5, votes=2, side="LONG")
 check(not ok_rev2, "F 反向 2/3 票仍要等冷却")
-ok_later, _ = risk_f.can_trade("ETHUSDT", now=_t0 + 15 * 60 + 1, votes=2, side="SHORT")
-check(ok_later, "F 冷却满 15 分钟后同方向可开")
+check(COOLDOWN_MINUTES == 10, "F 平仓后冷却 = 10 分钟（用户 2026-11-17 决定）")
+ok_later, _ = risk_f.can_trade("ETHUSDT", now=_t0 + 10 * 60 + 1, votes=2, side="SHORT")
+check(ok_later, "F 冷却满 10 分钟后同方向可开")
 # 止损后冷却 30 分钟：同方向 3/3 在 20 分钟时仍挡住，反向放行
 risk_f2 = RiskManager(["ETHUSDT"])
 risk_f2.record_trade_closed("ETHUSDT", -11.21, was_sl=True, now=_t0, side="SHORT")
