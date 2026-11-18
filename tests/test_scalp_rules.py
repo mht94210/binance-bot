@@ -2,9 +2,9 @@
 
 和德国实盘版的区别只有五处（用户 2026-11-17 决定：先做模拟盘版本测几天，放日本服务器跑）：
 A) 止损 3 倍 ATR（放远了，不会被噪音突然打掉；实盘版是 2 倍）
-B) 止盈不再按 ATR：浮盈扣掉全部手续费，净赚 2U 就平（止盈价按仓位反推）
+B) 止盈不再按 ATR：浮盈扣掉全部手续费，净赚 5U 就平（止盈价按仓位反推）
 C) 每天每币上限 50 单（用户目标一天 100 单；模拟盘测试，额度不做瓶颈）
-D) 每单固定 200U 保证金（用户 2026-11-17 决定；10 倍杠杆 = 2000U 名义仓位；仓位不再按风险倒推）
+D) 每单固定 500U 保证金（用户 2026-11-18 决定：500U 快进快出方案；10 倍杠杆 = 5000U 名义仓位；仓位不再按风险倒推）
 E) 简化信号（用户 2026-11-17 决定：均线定方向 + 2/3 票就开）：方向只看 5 分钟 MA5/MA20，
    三个投票（均线/分界线/量能）里 2 票就开；不要三模式、不要 ADX、不要 EMA50、
    不要过度延伸过滤（原来三模式 + 3/3 全票太严，200U 版上线 1 小时一单没开）
@@ -76,29 +76,29 @@ check(sig_l is not None and abs(sig_l["entry"] - sig_l["stop_loss"]) == 3 * 242.
       "A 做多止损也是 3 倍 ATR")
 check(SL_ATR_MULT == 3.0, "A SL_ATR_MULT = 3.0")
 
-# ---------- B) 止盈净赚 2U（扣掉全部手续费）----------
-check(SCALP_NET_TP_USDT == 2.0, "B SCALP_NET_TP_USDT = 2.0")
+# ---------- B) 止盈净赚 5U（扣掉全部手续费）----------
+check(SCALP_NET_TP_USDT == 5.0, "B SCALP_NET_TP_USDT = 5.0")
 # 做空：按信号的仓位和止盈价，用真正的 close_pnl 算，出场 maker 费
 qty_s = position_qty(sig_s["entry"], sig_s["stop_loss"])
 pnl_s = net_pnl_at("SHORT", sig_s["entry"], qty_s, sig_s["take_profit"], True)
-check(abs(pnl_s - 2.0) < 0.01, f"B 做空到止盈价净赚 2U（算出 {pnl_s:+.2f}U）")
+check(abs(pnl_s - 5.0) < 0.01, f"B 做空到止盈价净赚 5U（算出 {pnl_s:+.2f}U）")
 qty_l = position_qty(sig_l["entry"], sig_l["stop_loss"])
 pnl_l = net_pnl_at("LONG", sig_l["entry"], qty_l, sig_l["take_profit"], True)
-check(abs(pnl_l - 2.0) < 0.01, f"B 做多到止盈价净赚 2U（算出 {pnl_l:+.2f}U）")
+check(abs(pnl_l - 5.0) < 0.01, f"B 做多到止盈价净赚 5U（算出 {pnl_l:+.2f}U）")
 # 止盈价离入场很近（远小于止损距离），才配叫剥头皮
 check(abs(sig_s["take_profit"] - sig_s["entry"]) < (1.0/3.0) * abs(sig_s["stop_loss"] - sig_s["entry"]),
       "B 止盈距离 < 止损距离的 1/3")
-check("净赚 2U" in sig_s["reason"] and "净赚 2U" in sig_l["reason"],
-      "B 信号原因写明止盈净赚 2U")
-# 公式本身：BTC 做多 64500、数量 0.01375，止盈约 64671.3
+check("净赚 5U" in sig_s["reason"] and "净赚 5U" in sig_l["reason"],
+      "B 信号原因写明止盈净赚 5U")
+# 公式本身：BTC 做多 64500、数量 0.01375，止盈约 64889.5
 tp_formula = scalp_tp_price(64500.0, "LONG", 0.01375)
-check(abs(tp_formula - 64671.3) < 1.0, f"B 公式算做多止盈约 64671.3（算出 {tp_formula:.1f}）")
+check(abs(tp_formula - 64889.5) < 1.0, f"B 公式算做多止盈约 64889.5（算出 {tp_formula:.1f}）")
 tp_formula_s = scalp_tp_price(64500.0, "SHORT", 0.01375)
-check(abs(tp_formula_s - 64328.8) < 1.0, f"B 公式算做空止盈约 64328.8（算出 {tp_formula_s:.1f}）")
-# 止损出场是市价单（taker 费），固定 200U 保证金后一单净亏约 23.9U——
-# 仓位比风险倒推时大（BTC 0.031 对 0.0138），亏满也更大；写进测试免得以后有人偷偷改小
+check(abs(tp_formula_s - 64110.6) < 1.0, f"B 公式算做空止盈约 64110.6（算出 {tp_formula_s:.1f}）")
+# 止损出场是市价单（taker 费），固定 500U 保证金后一单净亏约 59.8U——
+# 仓位比风险倒推时大（BTC 0.0775 对 0.0138），亏满也更大；写进测试免得以后有人偷偷改小
 pnl_sl = net_pnl_at("SHORT", sig_s["entry"], qty_s, sig_s["stop_loss"], False)
-check(-25.0 < pnl_sl < -23.0, f"B 止损出场净亏约 23.9U（算出 {pnl_sl:+.2f}U）")
+check(-61.0 < pnl_sl < -59.0, f"B 止损出场净亏约 59.8U（算出 {pnl_sl:+.2f}U）")
 
 # ---------- B2) 手续费地板不启用：ATR 再小也不挡信号 ----------
 sig_tiny = evaluate(**base_kwargs(atr=1.0))
@@ -107,16 +107,16 @@ check(sig_tiny is not None, "B2 ATR 只有 1 点也不挡信号（地板已取�
 # ---------- C) 每天每币上限 50 单 ----------
 check(MAX_TRADES_PER_DAY == 50, "C MAX_TRADES_PER_DAY = 50")
 
-# ---------- D) 仓位：每单固定 200U 保证金（用户 2026-11-17 决定）----------
+# ---------- D) 仓位：每单固定 500U 保证金（用户 2026-11-18 决定：500U 快进快出方案）----------
 risk = RiskManager(["BTCUSDT", "ETHUSDT"])
 qty, margin, max_loss = risk.size_position(64500.0, 64500.0 + 726.0)
-check(margin == 200.0, f"D 3 倍 ATR 仓位保证金固定 200U（算出 {margin:.1f}U）")
-check(max_loss < 40.0, f"D 预期最大亏损 < 40U 上限（算出 {max_loss:.2f}U）")
+check(margin == 500.0, f"D 3 倍 ATR 仓位保证金固定 500U（算出 {margin:.1f}U）")
+check(max_loss < 60.0, f"D 预期最大亏损 < 60U 上限（算出 {max_loss:.2f}U）")
 qty2, margin2, _ = risk.size_position(64500.0, 64490.0)
-check(margin2 == 200.0, f"D 止损很近时保证金仍是固定 200U，不再封顶（算出 {margin2:.1f}U）")
+check(margin2 == 500.0, f"D 止损很近时保证金仍是固定 500U，不再封顶（算出 {margin2:.1f}U）")
 qty3, margin3, _ = risk.size_position(1840.0, 1840.0 - 12.0)
-check(abs(margin3 - 200.0) < 0.01 and abs(qty3 - 2000.0 / 1840.0) < 1e-6,
-      f"D ETH 入场 1840 数量 = 2000/1840（算出 qty {qty3:.5f}，保证金 {margin3:.1f}U）")
+check(abs(margin3 - 500.0) < 0.01 and abs(qty3 - 5000.0 / 1840.0) < 1e-6,
+      f"D ETH 入场 1840 数量 = 5000/1840（算出 qty {qty3:.5f}，保证金 {margin3:.1f}U）")
 
 # ---------- E) 简化信号：均线定方向 + 2/3 票就开 ----------
 # 量能不足：均线 + 分界线 = 2 票，照样开（原来 3/3 全票会挡住）

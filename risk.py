@@ -48,11 +48,11 @@ def is_news_pause(now: float) -> bool:
 
 
 def position_qty(entry: float, stop_loss: float) -> float:
-    """固定保证金仓位（用户 2026-11-17 决定：每单固定 200U 保证金）：
-    名义仓位 = FIXED_MARGIN_USDT × 杠杆（200U × 10 倍 = 2000U），数量 = 名义仓位 / 入场价。
+    """固定保证金仓位（用户 2026-11-18 决定：每单固定 500U 保证金）：
+    名义仓位 = FIXED_MARGIN_USDT × 杠杆（500U × 10 倍 = 5000U），数量 = 名义仓位 / 入场价。
     stop_loss 参数保留只为和调用方签名一致——仓位大小不再由止损距离决定，
     止损距离只决定这单亏满是多少（见 size_position 的 max_loss）。
-    保证金按 MAX_MARGIN_PER_TRADE_USDT 封顶（200U < 400U，平时不触发，纯作安全兜底）。
+    保证金按 MAX_MARGIN_PER_TRADE_USDT 封顶（500U = 500U，上限就是保证金本身，平时不触发，纯作安全兜底）。
     strategy.py 算剥头皮止盈价时也要用同一个数量，单点来源，免得两边算出来对不上。"""
     if entry <= 0:
         return 0.0
@@ -63,9 +63,9 @@ def position_qty(entry: float, stop_loss: float) -> float:
 
 def scalp_tp_price(entry: float, side: str, qty: float) -> float:
     """剥头皮止盈价：出场净赚正好 SCALP_NET_TP_USDT（已扣进场 maker + 出场 maker 手续费）。
-    净盈亏 = 数量×|止盈-入场| - 入场费 - 出场费 = SCALP_NET_TP_USDT（2U），解出止盈价。
-    做多：TP = (2 + qty×entry×(1+m)) / (qty×(1-m))；
-    做空：TP = (qty×entry×(1-m) - 2) / (qty×(1+m))，m = MAKER_FEE_PCT。
+    净盈亏 = 数量×|止盈-入场| - 入场费 - 出场费 = SCALP_NET_TP_USDT（5U），解出止盈价。
+    做多：TP = (5 + qty×entry×(1+m)) / (qty×(1-m))；
+    做空：TP = (qty×entry×(1-m) - 5) / (qty×(1+m))，m = MAKER_FEE_PCT。
     注意：止盈出场按 maker 限价单算（和 close_pnl 里 exit_is_maker=True 一致）；
     止损出场是市价单，按 taker 算，不走这个函数。"""
     m = MAKER_FEE_PCT
@@ -223,11 +223,11 @@ class RiskManager:
     # ---------- 仓位计算 ----------
     def size_position(self, entry: float, stop_loss: float) -> tuple[float, float, float]:
         """
-        固定保证金仓位（用户 2026-11-17 决定：每单固定 200U 保证金）：
-        数量 = 200U × 10 倍杠杆 / 入场价，与止损距离无关。返回 (数量, 保证金 USDT, 预期最大亏损 USDT)。
+        固定保证金仓位（用户 2026-11-18 决定：每单固定 500U 保证金）：
+        数量 = 500U × 10 倍杠杆 / 入场价，与止损距离无关。返回 (数量, 保证金 USDT, 预期最大亏损 USDT)。
         预期最大亏损 = 止损距离的亏损 + 一进一出手续费（保守按 Taker 算）；
-        固定 200U 后，止损越远亏满越多（ETH 3 倍 ATR 约 14U，BTC 约 20U），
-        超 40 U 硬上限返回数量 0，放弃这单。
+        固定 500U 后，止损越远亏满越多（ETH 3 倍 ATR 约 35U，BTC 约 50U），
+        超 60 U 硬上限返回数量 0，放弃这单。
         数量算法和模块函数 position_qty 是同一份（这里直接调它，免得两边改漏）。
         """
         stop_distance = abs(entry - stop_loss)
@@ -253,4 +253,4 @@ class RiskManager:
         if signal["side"] not in ("LONG", "SHORT"):
             raise ValueError("拒绝下单：方向不是 LONG/SHORT。")
         if signal.get("max_loss_usdt", 9999) > MAX_LOSS_PER_TRADE_USDT:
-            raise ValueError("拒绝下单：单笔亏损超 40 U 上限。")
+            raise ValueError("拒绝下单：单笔亏损超 60 U 上限。")
