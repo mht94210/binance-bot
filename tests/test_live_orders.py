@@ -1165,10 +1165,12 @@ def test_reconcile_closed_while_down_by_algo_stop():
         restore_gate(saved)
 
 
-# ---------- 止损单消失兜底（2026-11-19 ETH SHORT @1740.3 事故回归） ----------
-# 事故：止损 1757.3 被突破 7 小时仍未触发。持仓循环以前只查“触发了没”，
-# 止损单在交易所消失了也一声不吭，心跳还照常打印止损价。现在：poll 报
-# sl_missing，持仓循环连续 3 次确认后重挂，重挂不上就市价平仓。
+# ---------- 止损单消失只报警（2026-11-19 ETH SHORT @1740.3 教训回归） ----------
+# 止损 1757.3 被突破 12 小时仍未触发，后来用户说止损是他自己在 App 里取消的——
+# 不是机器人漏洞。持仓循环以前只查“触发了没”，止损单消失了也一声不吭，心跳还
+# 照常打印止损价。现在：poll 报 sl_missing，持仓循环大声记一笔“无止损保护”，
+# 心跳一直带这个提示；但绝不重挂、不平仓——重挂等于把用户亲手取消的止损又挂回去，
+# 平仓等于替用户平了他自己在管的单。
 def _open_short_with_algo_stop():
     client, trader = make_trader(auto_fill_entry=True)
     client.algo_routing = True
@@ -1176,7 +1178,7 @@ def _open_short_with_algo_stop():
     return client, trader, pos
 
 
-def test_stop_missing_when_algo_canceled_rehangs():
+def test_stop_missing_when_algo_canceled_alerts_only():
     saved = save_gate()
     try:
         enable_live_gate()
@@ -1192,21 +1194,22 @@ def test_stop_missing_when_algo_canceled_rehangs():
         check(res.get("sl_missing") is True, "止损消失回归：poll 报出 sl_missing")
         manage_live_position("BTCUSDT", pos, 70050.0, time.time(), risk, trader,
                              lambda: None, positions, hb)
-        check(pos["sl_order_id"] == old_sl, "止损消失回归：第 1 次确认不立刻重挂")
+        check(pos["sl_order_id"] == old_sl, "止损消失回归：第 1 次确认不重挂")
         manage_live_position("BTCUSDT", pos, 70050.0, time.time(), risk, trader,
                              lambda: None, positions, hb)
         manage_live_position("BTCUSDT", pos, 70050.0, time.time(), risk, trader,
                              lambda: None, positions, hb)
-        check(pos["sl_order_id"] != old_sl, "止损消失回归：第 3 次确认后重挂止损")
-        check(pos["sl_order_id"] in client.algo_orders, "止损消失回归：新止损在交易所挂着")
-        check(positions["BTCUSDT"] is pos, "止损消失回归：重挂后持仓还在")
-        check(any("止损没挂上" in m for m in LOGS), "止损消失回归：记了止损没挂上的大声日志")
-        check(any("已重挂止损" in m for m in LOGS), "止损消失回归：记了重挂日志")
+        check(pos["sl_order_id"] == old_sl, "止损消失回归：3 次确认后仍不重挂（用户可能手动取消）")
+        check(list(client.algo_orders) == [old_sl], "止损消失回归：没有新止损单出现")
+        check(positions["BTCUSDT"] is pos, "止损消失回归：持仓还在，不平仓")
+        check(len(client.market_closes) == 0, "止损消失回归：不市价平仓")
+        check(any("无止损保护" in m for m in LOGS), "止损消失回归：记了无止损保护的大声日志")
+        check(not any("已重挂止损" in m for m in LOGS), "止损消失回归：没有重挂日志")
     finally:
         restore_gate(saved)
 
 
-def test_stop_missing_when_order_deleted_rehangs():
+def test_stop_missing_when_order_deleted_alerts_only():
     saved = save_gate()
     try:
         enable_live_gate()
@@ -1221,9 +1224,10 @@ def test_stop_missing_when_order_deleted_rehangs():
         for _ in range(3):
             manage_live_position("BTCUSDT", pos, 70050.0, time.time(), risk, trader,
                                  lambda: None, positions, hb)
-        check(pos["sl_order_id"] != old_sl, "止损删除回归：第 3 次确认后重挂止损")
-        check(pos["sl_order_id"] in client.algo_orders, "止损删除回归：新止损在交易所挂着")
-        check(positions["BTCUSDT"] is pos, "止损删除回归：重挂后持仓还在")
+        check(pos["sl_order_id"] == old_sl, "止损删除回归：3 次确认后仍不重挂")
+        check(list(client.algo_orders) == [], "止损删除回归：没有新止损单出现")
+        check(positions["BTCUSDT"] is pos, "止损删除回归：持仓还在，不平仓")
+        check(len(client.market_closes) == 0, "止损删除回归：不市价平仓")
     finally:
         restore_gate(saved)
 
@@ -1243,22 +1247,24 @@ def test_stop_query_transient_error_is_not_missing():
         finally:
             client.futures_get_algo_order = orig
         check(res.get("closed") is False, "瞬时查单失败回归：不算平仓")
-        check(not res.get("sl_missing"), "瞬时查单失败回归：不算止损消失（不误重挂）")
+        check(not res.get("sl_missing"), "瞬时查单失败回归：不算止损消失（不误报）")
     finally:
         restore_gate(saved)
 
 
-def test_stop_missing_rehang_failure_market_closes():
+def test_stop_missing_never_rehangs_nor_closes():
+    # 止损消失后根本不该调 place_stop：调了就说明实现又偷偷重挂了。
     saved = save_gate()
     try:
         enable_live_gate()
         client, trader, pos = _open_short_with_algo_stop()
-        client.algo_orders[pos["sl_order_id"]]["algoStatus"] = "CANCELED"
+        old_sl = pos["sl_order_id"]
+        client.algo_orders[old_sl]["algoStatus"] = "CANCELED"
         orig_place_stop = trader.place_stop
 
-        def failing_place_stop(symbol, side, stop_price):
-            raise LiveOrderError("挂止损失败：模拟重挂失败")
-        trader.place_stop = failing_place_stop
+        def forbidden_place_stop(symbol, side, stop_price):
+            raise AssertionError("止损消失不应重挂")
+        trader.place_stop = forbidden_place_stop
         risk = RiskManager(["BTCUSDT", "ETHUSDT"])
         positions = {"BTCUSDT": pos, "ETHUSDT": None}
         hb = {"BTCUSDT": 0.0, "ETHUSDT": 0.0}
@@ -1268,9 +1274,10 @@ def test_stop_missing_rehang_failure_market_closes():
                                      lambda: None, positions, hb)
         finally:
             trader.place_stop = orig_place_stop
-        check(positions["BTCUSDT"] is None, "重挂失败回归：市价平掉持仓，绝不留裸仓")
-        check(len(client.market_closes) == 1, "重挂失败回归：市价平仓只下一次")
-        check(any("重挂失败" in m for m in LOGS), "重挂失败回归：记了重挂失败的大声日志")
+        check(pos["sl_order_id"] == old_sl, "不重挂回归：止损单号没变")
+        check(positions["BTCUSDT"] is pos, "不重挂回归：持仓还在")
+        check(len(client.market_closes) == 0, "不重挂回归：不市价平仓")
+        check(any("无止损保护" in m for m in LOGS), "不重挂回归：记了无止损保护的大声日志")
     finally:
         restore_gate(saved)
 
@@ -1321,10 +1328,10 @@ if __name__ == "__main__":
     test_reconcile_orphan_with_algo_stop()
     test_reconcile_cancels_stray_algo_orders()
     test_reconcile_closed_while_down_by_algo_stop()
-    test_stop_missing_when_algo_canceled_rehangs()
-    test_stop_missing_when_order_deleted_rehangs()
+    test_stop_missing_when_algo_canceled_alerts_only()
+    test_stop_missing_when_order_deleted_alerts_only()
     test_stop_query_transient_error_is_not_missing()
-    test_stop_missing_rehang_failure_market_closes()
+    test_stop_missing_never_rehangs_nor_closes()
     print()
     if FAILURES:
         print(f"FAILED: {len(FAILURES)} 项")

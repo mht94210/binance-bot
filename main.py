@@ -24,9 +24,9 @@ Binance BTC+ETH 永续合约短线机器人 —— 10 倍快进快出方案（�
 - 三模式按 1 小时 ADX 智能调配（2026-11-16 用户决定，保留全部策略；2026-11-17 用户决定震荡上限
   从 15 提到 25，横盘让震荡接管）：>=25 强趋势用 trend
   （原 6 胜策略：EMA50 方向过滤 + 5m ADX>25 + 3/3 票）；<25 震荡用 range（反转：2/3 票 +
-  只在 2 小时区间下 1/4 做多、上 1/4 做空，止损沿外 1.5 倍 ATR，止盈到对面沿）；1h ADX 拿不到时
+  只在 6 小时区间下 1/4 做多、上 1/4 做空，止损沿外 1.5 倍 ATR，止盈到对面沿）；1h ADX 拿不到时
   默认 momentum（实时信号，5m 均线 3/3 全票，多空由 5 分钟波动决定，ADX 仅参考）；range 有过度延伸过滤
-  （离 2 小时极端点超 3 倍 ATR 不追），trend 模式不适用
+  （离 6 小时极端点超 3 倍 ATR 不追），trend 模式不适用
 - 信号：5 分钟 K 线实时判断（当前未收盘 K 线，每 60 秒一次），趋势/动量 3/3 全票，震荡 2/3 票
 - 趋势/动量止损 2 倍 ATR，止盈 3 倍 ATR，盈亏比 1:1.5；震荡止损沿外 1.5 倍 ATR，止盈到对面沿；
   止盈目标 < 0.30% 不做
@@ -195,7 +195,7 @@ def compute_indicators(symbol: str) -> dict | None:
     # 滚动分界线：最近 12 根 5 分钟 K 线（60 分钟）最高最低价的中点，跟着市场走
     recent = ksig[-MIDLINE_LOOKBACK_CANDLES:]
     midline = (max(k["high"] for k in recent) + min(k["low"] for k in recent)) / 2
-    # 2 小时区间高低点：过度延伸过滤用（跌多了不追空、涨多了不追多）
+    # 6 小时区间高低点：过度延伸过滤用（跌多了不追空、涨多了不追多）
     range_window = ksig[-RANGE_LOOKBACK_CANDLES:]
     range_high = max(k["high"] for k in range_window)
     range_low = min(k["low"] for k in range_window)
@@ -570,9 +570,11 @@ class LiveTrader:
         """查止损单状态（归一化返回）：
         {"triggered", "exit_price", "exit_order_id", "gone"}。
         gone=True = 止损单已不在交易所（被撤/过期/拒单，或两边都查不到
-        -2013），不是“还没触发”。2026-11-19 实盘事故：ETH SHORT @1740.3
-        的止损 1757.3 被突破 7 小时仍未触发——持仓循环以前只查“触发了没”，
-        单子消失了也一声不吭。从此 gone 要单独报出来，调用方负责重挂。
+        -2013），不是“还没触发”。2026-11-19：ETH SHORT @1740.3 的止损
+        1757.3 被突破 12 小时仍未触发，后来用户说止损是他自己在 App 里
+        取消的——不是机器人漏洞。但持仓循环以前只查“触发了没”，单子消失
+        了也一声不吭。从此 gone 要单独报出来，调用方只报警、不重挂
+        （可能是用户手动取消，重挂等于跟用户对着干）。
         新版库：止损是 algo 单，用 futures_get_algo_order 查，algoStatus=
         TRIGGERED（或已有实际成交价）才算触发成交，actualOrderId 是触发后
         产生的真实市价单号（查手续费要用它），actualPrice 是成交均价。
@@ -628,13 +630,14 @@ class LiveTrader:
     # ---------- 持仓查询 ----------
     def poll_exit_orders(self, symbol: str, position: dict) -> dict:
         """查止盈/止损订单状态。返回 {"closed", "kind"("TP"/"SL"), "exit_price", "exit_order_id",
-        "sl_missing"}。sl_missing=True = 止损单已不在交易所（2026-11-19 事故教训），
-        调用方负责确认后重挂；它不是平仓。
+        "sl_missing", "tp_missing"}。sl_missing=True = 止损单已不在交易所
+        （2026-11-19 教训：ETH 的止损是用户自己取消的，持仓循环以前只查“触发了没”，
+        单子没了也不吭声）；tp_missing 同理。调用方只报警，不重挂、不平仓；它不是平仓。
         成交的那条一经发现，立刻撤掉另一条（免得反手又成交）。
         止损是 algo 单：走 _query_stop_order（algo 查询），撤单走 cancel_algo_order；
         止盈是普通 LIMIT 单：走普通查询/撤单。"""
         result = {"closed": False, "kind": None, "exit_price": None, "exit_order_id": None,
-                  "sl_missing": False}
+                  "sl_missing": False, "tp_missing": False}
         for kind, oid in (("TP", position.get("tp_order_id")),
                           ("SL", position.get("sl_order_id"))):
             if not oid:
@@ -654,8 +657,18 @@ class LiveTrader:
                     result["exit_price"] = stop["exit_price"]
                     result["exit_order_id"] = stop["exit_order_id"]
                 else:
-                    order = self.client.futures_get_order(symbol=symbol, orderId=oid, recvWindow=RECV_WINDOW_MS)
-                    if order.get("status") != "FILLED":
+                    try:
+                        order = self.client.futures_get_order(symbol=symbol, orderId=oid, recvWindow=RECV_WINDOW_MS)
+                    except Exception as e:  # noqa: BLE001 - 两边都查不到（-2013）= 止盈单已消失
+                        if getattr(e, "code", None) == -2013:
+                            result["tp_missing"] = True
+                            continue
+                        raise
+                    status = str(order.get("status") or "").upper()
+                    if status in ("CANCELED", "CANCELLED", "EXPIRED", "REJECTED"):
+                        result["tp_missing"] = True
+                        continue
+                    if status != "FILLED":
                         continue
                     result["closed"] = True
                     result["kind"] = "TP"
@@ -876,36 +889,26 @@ def manage_live_position(symbol: str, position: dict, price: float, now: float,
         save_state()
         return
     if res.get("sl_missing"):
-        # 止损单消失兜底（2026-11-19 事故：ETH SHORT @1740.3 的止损 1757.3
-        # 被突破 7 小时没触发，就是因为以前只查“触发了没”，单子没了也不吭声）。
-        # 连续 3 轮（约 15 秒）都确认消失才重挂，防瞬时查询抖动误判；
-        # 重挂失败就市价平仓，绝不留裸仓。
+        # 止损单不在交易所（2026-11-19 教训：ETH SHORT @1740.3 的止损是用户自己
+        # 在 App 里取消的，不是机器人漏洞。只报警、不重挂、不平仓：重挂等于把用户
+        # 亲手取消的止损又挂回去，平仓等于替用户平了他自己在管的单）。
+        # 第 1 次确认就大声记一笔；之后心跳一直带“无止损保护”，直到止损单重新出现。
         missing = position.get("sl_missing_polls", 0) + 1
         position["sl_missing_polls"] = missing
         if missing == 1:
-            log(f"严重：{symbol} 止损单已不在交易所，止损没挂上（第 1 次确认），"
-                f"连续 3 次确认后重挂止损 {position['stop_loss']:.1f}。")
-        if missing >= 3:
-            position["sl_missing_polls"] = 0
-            try:
-                new_id = live_trader.place_stop(symbol, position["side"], position["stop_loss"])
-                position["sl_order_id"] = new_id
-                log(f"止损单已消失，已重挂止损 {position['stop_loss']:.1f}（新单号 {new_id}）。")
-                save_state()
-            except Exception as e:  # noqa: BLE001
-                log(f"严重：{symbol} 止损单消失且重挂失败（{e}），立刻市价平仓，绝不留裸仓。")
-                try:
-                    live_trader.market_close(symbol, position["side"], position["qty"])
-                except Exception as e2:  # noqa: BLE001
-                    log(f"严重！！{symbol} 止损消失后市价平仓也失败：{e2}。交易所仍有持仓，请立即人工处理。")
-                    return
-                pnl = close_pnl(position, price, exit_is_maker=False)
-                risk.record_trade_closed(symbol, pnl, was_sl=False, now=now)
-                positions[symbol] = None
-                save_state()
-                return
+            log(f"严重：{symbol} 止损单已不在交易所（可能手动取消），当前无止损保护，"
+                f"持仓继续，不重挂、不平仓，等用户处理。原止损价 {position['stop_loss']:.1f} 仅作显示。")
     else:
         position["sl_missing_polls"] = 0
+    if res.get("tp_missing"):
+        # 止盈单不在交易所（同理：可能是用户手动取消），只报警、不重挂。
+        tp_missing = position.get("tp_missing_polls", 0) + 1
+        position["tp_missing_polls"] = tp_missing
+        if tp_missing == 1:
+            log(f"严重：{symbol} 止盈单已不在交易所（可能手动取消），当前无止盈单，"
+                f"持仓继续，不重挂，等用户处理。原止盈价 {position['take_profit']:.1f} 仅作显示。")
+    else:
+        position["tp_missing_polls"] = 0
     try:
         st = live_trader.get_position_state(symbol)
     except Exception as e:  # noqa: BLE001
@@ -925,7 +928,12 @@ def manage_live_position(symbol: str, position: dict, price: float, now: float,
         side = position["side"]
         if (side == "LONG" and price >= entry + risk_distance) or \
            (side == "SHORT" and price <= entry - risk_distance):
-            if live_trader.move_stop_to_breakeven(symbol, position):
+            if res.get("sl_missing"):
+                # 止损单不在（疑似手动取消）：保本要撤单重挂，等于重挂一个用户取消的止损，不做。
+                if not position.get("breakeven_skip_logged"):
+                    position["breakeven_skip_logged"] = True
+                    log(f"{symbol} 保本已到（赚满 1 倍风险），但止损单不在交易所，不移动止损（疑似手动取消）。")
+            elif live_trader.move_stop_to_breakeven(symbol, position):
                 position["stop_loss"] = entry
                 position["breakeven_done"] = True
                 log(f"保本触发：{symbol} {side} 已赚 1 倍风险，止损移到成本价 {entry:.1f}（交易所已重挂）。")
@@ -936,7 +944,11 @@ def manage_live_position(symbol: str, position: dict, price: float, now: float,
         last_heartbeat_log[symbol] = now
         float_pnl = (price - position["entry"]) * position["qty"] if position["side"] == "LONG" \
             else (position["entry"] - price) * position["qty"]
-        missing_note = " 止损单疑似消失！" if position.get("sl_missing_polls") else ""
+        missing_note = ""
+        if position.get("sl_missing_polls"):
+            missing_note += " 无止损保护（止损单不在，疑似手动取消）！"
+        if position.get("tp_missing_polls"):
+            missing_note += " 无止盈单（止盈单不在，疑似手动取消）！"
         log(f"持仓中：{symbol} {position['side']} @{position['entry']:.1f}，现价 {price:.1f}，浮盈 {float_pnl:+.2f} U，"
             f"止损 {position['stop_loss']:.1f}，止盈 {position['take_profit']:.1f}，"
             f"保本{'已移' if position['breakeven_done'] else '未触发'}。{missing_note}")
@@ -950,8 +962,9 @@ def reconcile_live_positions(live_trader: LiveTrader, positions: dict,
     主循环每 15 分钟重试一次，见 main）。
     - 交易所没有、state 有：持仓已在停机期间平掉（止损/止盈成交），按成交订单的均价平账；
       查不到成交价就按现价估算并大声记一笔。
-    - 交易所和 state 都有：以交易所的数量/入场价为准；止损/止盈订单丢了就重挂，
-      重挂不上就市价平仓。
+    - 交易所和 state 都有：以交易所的数量/入场价为准；止损/止盈订单丢了不重挂、
+      不平仓（2026-11-19 教训：可能是用户手动取消），大声记一笔，持仓继续由用户管理。
+      孤儿持仓（state 里没有）才按策略重建保护。
     - 交易所里有、state 里没有（孤儿持仓）：绝不能丢。先从挂单里找止损/止盈认领；
       缺哪条按策略盈亏比（止盈 = 1.5 倍止损距离）从另一条反推重建；两条都没有
       就立刻市价平仓。认领后该币种随持仓自动停新单（每币种最多 1 单）。
@@ -1083,31 +1096,49 @@ def reconcile_live_positions(live_trader: LiveTrader, positions: dict,
         # 止损已在成本价上 = 保本早已触发，别让主循环再撤单重挂一次
         if sl_order is not None and abs(position["stop_loss"] - entry) < 1e-9:
             position["breakeven_done"] = True
-        # 缺哪条保护就重建：止盈 = 入场 ± 1.5 倍止损距离（策略原定盈亏比），止损同理反推
+        # 缺保护单：分两种。孤儿持仓（state 里没有，用户意图未知）按策略重建保护；
+        # 已记录的持仓不重挂、不平仓——2026-11-19 教训：ETH 的止损就是用户自己取消的，
+        # 重挂等于跟用户对着干，平仓等于替用户平了他自己在管的单。
         need_close = False
         if sl_order is None and tp_order is not None:
-            tp_dist = abs(position["take_profit"] - entry)
-            sl = entry - tp_dist / 1.5 if side == "LONG" else entry + tp_dist / 1.5
-            try:
-                position["sl_order_id"] = live_trader.place_stop(symbol, side, sl)
-                position["stop_loss"] = sl
-                log(f"对账：{symbol} 止损单丢了，按止盈反推重挂止损 {sl:.1f}。")
-            except Exception as e:  # noqa: BLE001
-                log(f"严重：{symbol} 重挂止损失败（{e}），立刻市价平仓。")
-                need_close = True
+            if saved is None:
+                tp_dist = abs(position["take_profit"] - entry)
+                sl = entry - tp_dist / 1.5 if side == "LONG" else entry + tp_dist / 1.5
+                try:
+                    position["sl_order_id"] = live_trader.place_stop(symbol, side, sl)
+                    position["stop_loss"] = sl
+                    log(f"对账：{symbol} 止损单丢了，按止盈反推重挂止损 {sl:.1f}。")
+                except Exception as e:  # noqa: BLE001
+                    log(f"严重：{symbol} 重挂止损失败（{e}），立刻市价平仓。")
+                    need_close = True
+            else:
+                position["sl_order_id"] = None
+                log(f"严重：{symbol} 止损单不在交易所（可能手动取消），当前无止损保护，"
+                    f"持仓继续由用户管理，不重挂。原止损价 {position['stop_loss']:.1f} 仅作显示。")
         if tp_order is None and sl_order is not None and not need_close:
-            sl_dist = abs(position["stop_loss"] - entry)
-            tp = entry + sl_dist * 1.5 if side == "LONG" else entry - sl_dist * 1.5
-            try:
-                position["tp_order_id"] = live_trader.place_take_profit(symbol, side, qty, tp)
-                position["take_profit"] = tp
-                log(f"对账：{symbol} 止盈单丢了，按止损反推重挂止盈 {tp:.1f}。")
-            except Exception as e:  # noqa: BLE001
-                log(f"严重：{symbol} 重挂止盈失败（{e}），立刻市价平仓。")
-                need_close = True
+            if saved is None:
+                sl_dist = abs(position["stop_loss"] - entry)
+                tp = entry + sl_dist * 1.5 if side == "LONG" else entry - sl_dist * 1.5
+                try:
+                    position["tp_order_id"] = live_trader.place_take_profit(symbol, side, qty, tp)
+                    position["take_profit"] = tp
+                    log(f"对账：{symbol} 止盈单丢了，按止损反推重挂止盈 {tp:.1f}。")
+                except Exception as e:  # noqa: BLE001
+                    log(f"严重：{symbol} 重挂止盈失败（{e}），立刻市价平仓。")
+                    need_close = True
+            else:
+                position["tp_order_id"] = None
+                log(f"严重：{symbol} 止盈单不在交易所（可能手动取消），当前无止盈单，"
+                    f"持仓继续由用户管理，不重挂。原止盈价 {position['take_profit']:.1f} 仅作显示。")
         if sl_order is None and tp_order is None:
-            log(f"严重：{symbol} 交易所持仓没有任何保护单（裸仓），立刻市价平仓。")
-            need_close = True
+            if saved is None:
+                log(f"严重：{symbol} 交易所持仓没有任何保护单（裸仓），立刻市价平仓。")
+                need_close = True
+            else:
+                position["sl_order_id"] = None
+                position["tp_order_id"] = None
+                log(f"严重：{symbol} 交易所持仓没有任何保护单（疑似手动取消），"
+                    f"持仓继续由用户管理，不平仓。")
         if need_close:
             try:
                 live_trader.market_close(symbol, side, qty)
@@ -1125,8 +1156,13 @@ def reconcile_live_positions(live_trader: LiveTrader, positions: dict,
             continue
         positions[symbol] = position
         save_state()
+        protect_note = ""
+        if position.get("sl_order_id") is None:
+            protect_note += "（无止损保护）"
+        if position.get("tp_order_id") is None:
+            protect_note += "（无止盈单）"
         log(f"对账：{symbol} 持仓已确认 {side} {qty:.5f} @ {entry:.1f}，"
-            f"止损 {position['stop_loss']:.1f}，止盈 {position['take_profit']:.1f}。")
+            f"止损 {position['stop_loss']:.1f}，止盈 {position['take_profit']:.1f}。{protect_note}")
 
 
 def close_pnl(position: dict, exit_price: float, exit_is_maker: bool) -> float:
@@ -1146,9 +1182,9 @@ def main() -> None:
     log("BTC+ETH 合约短线机器人启动（10 倍快进快出方案，2026-11-10 用户确认；2026-11-11 加 ETH）")
     log(f"标的: {', '.join(SYMBOLS)} | Dry-Run: {DRY_RUN} | 实盘开关: {LIVE_TRADING_ENABLED} | 实盘已开: {live_trading_active()}")
     log("策略: 三模式按 1 小时 ADX 智能调配（>=25 强趋势用 trend 原 6 胜策略：EMA50 方向过滤 + 5m ADX>25；"
-        "<25 震荡用 range 反转策略：2/3 票 + 只在 2 小时区间下 1/4 做多、上 1/4 做空，止损沿外 1.5 倍 ATR，"
+        "<25 震荡用 range 反转策略：2/3 票 + 只在 6 小时区间下 1/4 做多、上 1/4 做空，止损沿外 1.5 倍 ATR，"
         "止盈到对面沿；1h ADX 拿不到时默认 momentum 动量策略：实时信号，5m 均线 3/3 全票，多空由 5 分钟波动决定，ADX 仅参考；"
-        "range 有过度延伸过滤：离 2 小时极端点超 3 倍 ATR 不追）+ 量能过滤；"
+        "range 有过度延伸过滤：离 6 小时极端点超 3 倍 ATR 不追）+ 量能过滤；"
         "趋势/动量止损 2 倍 ATR，止盈 3 倍 ATR，盈亏比 1:1.5；赚 1 倍风险保本；"
         "进场限价单，止损市价单；冷却 15 分钟（止损后 30 分钟，3/3 强信号可跳过）；"
         "每个币种一天最多 10 单、同时最多 1 单（全账户同时最多 2 单）")

@@ -9,6 +9,7 @@ A) 少而精：3/3 全票、保证金 400U、5m 信号/ATR；2026-11-16 去掉 E
    震荡模式 2/3 票就开，止损 = 沿外 1.5 倍 ATR，止盈 = 对面沿；每单固定 200U 保证金
    2026-11-18 用户决定（15 分钟信号反弹抓不住）：信号周期改成 5 分钟；1h ADX 定模式、2 小时区间、
    止损止盈倍数、固定 200U、冷却/熔断都不变；区间回看 24 根 5 分钟 K 线，分界线回看 12 根
+   2026-11-19 用户决定（2 小时窗口跟着价格滑、震荡开不出单）：区间窗口 2 小时 -> 6 小时，区间回看 72 根
 B) 放宽止损：趋势/动量止损 2 倍 ATR、止盈 3 倍 ATR、盈亏比 1:1.5
 C) 冷却跳过：3/3 强信号跳过冷却；连亏暂停/消息禁入/每日熔断是硬刹车
 D) 熔断：日熔断 100U；state.json 丢失时收紧到 50U；UTC 午夜恢复 100U
@@ -224,14 +225,15 @@ def test_atr5_sl_tp():
 
 def test_signal_timeframe_5m():
     # 2026-11-18 用户决定：信号周期 15 分钟 -> 5 分钟（反弹抓不住），区间窗口 6 小时 -> 2 小时；
-    # 1h ADX 定模式、止损止盈倍数不变。回看窗口按时间换算：区间 2 小时 = 24 根 5 分钟 K 线，
+    # 2026-11-19 用户决定：区间窗口 2 小时 -> 6 小时（2 小时窗口跟着价格滑、震荡开不出单）。
+    # 1h ADX 定模式、止损止盈倍数不变。回看窗口按时间换算：区间 6 小时 = 72 根 5 分钟 K 线，
     # 分界线 60 分钟 = 12 根 5 分钟 K 线。
     check(SIGNAL_INTERVAL == "5m", f"A 信号周期 5m（实得 {SIGNAL_INTERVAL}）")
     check(SIGNAL_INTERVAL_MINUTES == 5, f"A 信号周期 5 分钟（实得 {SIGNAL_INTERVAL_MINUTES}）")
-    check(RANGE_LOOKBACK_CANDLES == 24, f"A 2 小时区间回看 24 根 5m K 线（实得 {RANGE_LOOKBACK_CANDLES}）")
+    check(RANGE_LOOKBACK_CANDLES == 72, f"A 6 小时区间回看 72 根 5m K 线（实得 {RANGE_LOOKBACK_CANDLES}）")
     check(MIDLINE_LOOKBACK_CANDLES == 12, f"A 分界线回看 12 根 5m K 线（实得 {MIDLINE_LOOKBACK_CANDLES}）")
-    # compute_indicators 必须拉 5m K 线（80 根，够 24 根区间回看 + EMA50），
-    # 区间高低取最后 24 根，分界线取最后 12 根，1h ADX 仍拉 1h K 线定模式。
+    # compute_indicators 必须拉 5m K 线（80 根，够 72 根区间回看 + EMA50），
+    # 区间高低取最后 72 根，分界线取最后 12 根，1h ADX 仍拉 1h K 线定模式。
     from unittest.mock import patch
 
     def _candle(i, base):
@@ -254,13 +256,13 @@ def test_signal_timeframe_5m():
     check(calls[1] == ("BTCUSDT", "1h", 40), f"A 1h ADX 仍拉 1h K 线（实得 {calls[1]}）")
     check(ind is not None, "A 5m K 线够用，指标算得出来")
     if ind is not None:
-        win24 = k5m[-24:]
-        exp_high = max(k["high"] for k in win24)
-        exp_low = min(k["low"] for k in win24)
+        win72 = k5m[-72:]
+        exp_high = max(k["high"] for k in win72)
+        exp_low = min(k["low"] for k in win72)
         check(abs(ind["range_high"] - exp_high) < 1e-9,
-              f"A 区间高点 = 最后 24 根最高价（实得 {ind['range_high']:.1f}，预期 {exp_high:.1f}）")
+              f"A 区间高点 = 最后 72 根最高价（实得 {ind['range_high']:.1f}，预期 {exp_high:.1f}）")
         check(abs(ind["range_low"] - exp_low) < 1e-9,
-              f"A 区间低点 = 最后 24 根最低价（实得 {ind['range_low']:.1f}，预期 {exp_low:.1f}）")
+              f"A 区间低点 = 最后 72 根最低价（实得 {ind['range_low']:.1f}，预期 {exp_low:.1f}）")
         win12 = k5m[-12:]
         exp_mid = (max(k["high"] for k in win12) + min(k["low"] for k in win12)) / 2
         check(abs(ind["midline"] - exp_mid) < 1e-9,
