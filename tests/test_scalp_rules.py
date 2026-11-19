@@ -2,7 +2,7 @@
 
 和德国实盘版的区别只有五处（用户 2026-11-17 决定：先做模拟盘版本测几天，放日本服务器跑）：
 A) 止损 3 倍 ATR（放远了，不会被噪音突然打掉；实盘版是 2 倍）
-B) 止盈不再按 ATR：浮盈扣掉全部手续费，净赚 5U 就平（止盈价按仓位反推）
+B) 止盈不再按 ATR：浮盈扣掉全部手续费，净赚 15U 就平（止盈价按仓位反推）
 C) 每天每币上限 50 单（用户目标一天 100 单；模拟盘测试，额度不做瓶颈）
 D) 每单固定 500U 保证金（用户 2026-11-18 决定：500U 快进快出方案；10 倍杠杆 = 5000U 名义仓位；仓位不再按风险倒推）
 E) 简化信号（用户 2026-11-17 决定：均线定方向 + 2/3 票就开）：方向只看 5 分钟 MA5/MA20，
@@ -76,25 +76,25 @@ check(sig_l is not None and abs(sig_l["entry"] - sig_l["stop_loss"]) == 3 * 242.
       "A 做多止损也是 3 倍 ATR")
 check(SL_ATR_MULT == 3.0, "A SL_ATR_MULT = 3.0")
 
-# ---------- B) 止盈净赚 5U（扣掉全部手续费）----------
-check(SCALP_NET_TP_USDT == 5.0, "B SCALP_NET_TP_USDT = 5.0")
+# ---------- B) 止盈净赚 15U（扣掉全部手续费）----------
+check(SCALP_NET_TP_USDT == 15.0, "B SCALP_NET_TP_USDT = 15.0")
 # 做空：按信号的仓位和止盈价，用真正的 close_pnl 算，出场 maker 费
 qty_s = position_qty(sig_s["entry"], sig_s["stop_loss"])
 pnl_s = net_pnl_at("SHORT", sig_s["entry"], qty_s, sig_s["take_profit"], True)
-check(abs(pnl_s - 5.0) < 0.01, f"B 做空到止盈价净赚 5U（算出 {pnl_s:+.2f}U）")
+check(abs(pnl_s - 15.0) < 0.01, f"B 做空到止盈价净赚 15U（算出 {pnl_s:+.2f}U）")
 qty_l = position_qty(sig_l["entry"], sig_l["stop_loss"])
 pnl_l = net_pnl_at("LONG", sig_l["entry"], qty_l, sig_l["take_profit"], True)
-check(abs(pnl_l - 5.0) < 0.01, f"B 做多到止盈价净赚 5U（算出 {pnl_l:+.2f}U）")
+check(abs(pnl_l - 15.0) < 0.01, f"B 做多到止盈价净赚 15U（算出 {pnl_l:+.2f}U）")
 # 止盈价离入场很近（远小于止损距离），才配叫剥头皮
 check(abs(sig_s["take_profit"] - sig_s["entry"]) < (1.0/3.0) * abs(sig_s["stop_loss"] - sig_s["entry"]),
       "B 止盈距离 < 止损距离的 1/3")
-check("净赚 5U" in sig_s["reason"] and "净赚 5U" in sig_l["reason"],
-      "B 信号原因写明止盈净赚 5U")
-# 公式本身：BTC 做多 64500、数量 0.01375，止盈约 64889.5
+check("净赚 15U" in sig_s["reason"] and "净赚 15U" in sig_l["reason"],
+      "B 信号原因写明止盈净赚 15U")
+# 公式本身：BTC 做多 64500、数量 0.01375，止盈约 65616.9（15U 版；5U 版是 64889.5）
 tp_formula = scalp_tp_price(64500.0, "LONG", 0.01375)
-check(abs(tp_formula - 64889.5) < 1.0, f"B 公式算做多止盈约 64889.5（算出 {tp_formula:.1f}）")
+check(abs(tp_formula - 65616.9) < 1.0, f"B 公式算做多止盈约 65616.9（算出 {tp_formula:.1f}）")
 tp_formula_s = scalp_tp_price(64500.0, "SHORT", 0.01375)
-check(abs(tp_formula_s - 64110.6) < 1.0, f"B 公式算做空止盈约 64110.6（算出 {tp_formula_s:.1f}）")
+check(abs(tp_formula_s - 63383.5) < 1.0, f"B 公式算做空止盈约 63383.5（算出 {tp_formula_s:.1f}）")
 # 止损出场是市价单（taker 费），固定 500U 保证金后一单净亏约 59.8U——
 # 仓位比风险倒推时大（BTC 0.0775 对 0.0138），亏满也更大；写进测试免得以后有人偷偷改小
 pnl_sl = net_pnl_at("SHORT", sig_s["entry"], qty_s, sig_s["stop_loss"], False)

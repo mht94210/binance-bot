@@ -63,9 +63,9 @@ def position_qty(entry: float, stop_loss: float) -> float:
 
 def scalp_tp_price(entry: float, side: str, qty: float) -> float:
     """剥头皮止盈价：出场净赚正好 SCALP_NET_TP_USDT（已扣进场 maker + 出场 maker 手续费）。
-    净盈亏 = 数量×|止盈-入场| - 入场费 - 出场费 = SCALP_NET_TP_USDT（5U），解出止盈价。
-    做多：TP = (5 + qty×entry×(1+m)) / (qty×(1-m))；
-    做空：TP = (qty×entry×(1-m) - 5) / (qty×(1+m))，m = MAKER_FEE_PCT。
+    净盈亏 = 数量×|止盈-入场| - 入场费 - 出场费 = SCALP_NET_TP_USDT（15U），解出止盈价。
+    做多：TP = (15 + qty×entry×(1+m)) / (qty×(1-m))；
+    做空：TP = (qty×entry×(1-m) - 15) / (qty×(1+m))，m = MAKER_FEE_PCT。
     注意：止盈出场按 maker 限价单算（和 close_pnl 里 exit_is_maker=True 一致）；
     止损出场是市价单，按 taker 算，不走这个函数。"""
     m = MAKER_FEE_PCT
