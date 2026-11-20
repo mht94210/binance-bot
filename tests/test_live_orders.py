@@ -641,7 +641,10 @@ def test_rounding():
 
 
 # ---------- 启动对账 ----------
-def test_reconcile_orphan_position():
+def test_reconcile_orphan_position_not_touched():
+    """2026-11-20 用户决定：记录外的持仓一律当手动单，机器人不碰、不平仓、
+    不重挂保护（此前按旧规则认领并接管；2026-11-20 20:45 还曾市价平掉用户
+    手动 BTC 多单 0.016 @61468）。"""
     client, trader = make_trader(auto_fill_entry=True)
     client.positions["BTCUSDT"] = -0.02
     client.entries["BTCUSDT"] = 70000.0
@@ -653,27 +656,53 @@ def test_reconcile_orphan_position():
     positions = {"BTCUSDT": None, "ETHUSDT": None}
     risk = RiskManager(["BTCUSDT", "ETHUSDT"])
     blocked = set()
-    reconcile_live_positions(trader, positions, risk, blocked, lambda: None)
-    pos = positions["BTCUSDT"]
-    check(pos is not None and pos.get("orphan") is True, "孤儿持仓被认领")
-    check(pos["sl_order_id"] == sl["orderId"] and pos["tp_order_id"] == tp["orderId"],
-          "认领了现有的止损止盈单")
-    check(abs(pos["stop_loss"] - 70600.0) < 1e-9 and abs(pos["take_profit"] - 69100.0) < 1e-9,
-          "认领后止损止盈价正确")
-    check("BTCUSDT" not in blocked, "认领后不暂停该币种（随持仓自动停新单）")
+    retryable = set()
+    reconcile_live_positions(trader, positions, risk, blocked, lambda: None,
+                             retryable=retryable)
+    check(positions["BTCUSDT"] is None, "手动单不认领进 state")
+    check(len(client.market_closes) == 0, "手动单不市价平仓")
+    check(client.orders[sl["orderId"]]["status"] != "CANCELED", "手动单的止损不撤")
+    check(client.orders[tp["orderId"]]["status"] != "CANCELED", "手动单的止盈不撤")
+    check("BTCUSDT" in blocked, "手动单所在币种暂停新开单")
+    check("BTCUSDT" in retryable, "手动单所在币种进重试队列")
 
 
-def test_reconcile_orphan_without_protection_market_closes():
+def test_reconcile_orphan_without_protection_not_touched():
+    """2026-11-20 用户决定：无保护的记录外持仓也不平仓——那是用户的手动单。"""
     client, trader = make_trader(auto_fill_entry=True)
     client.positions["BTCUSDT"] = -0.02
     client.entries["BTCUSDT"] = 70000.0
     positions = {"BTCUSDT": None, "ETHUSDT": None}
     risk = RiskManager(["BTCUSDT", "ETHUSDT"])
     blocked = set()
-    reconcile_live_positions(trader, positions, risk, blocked, lambda: None)
-    check(positions["BTCUSDT"] is None, "无保护的孤儿持仓被市价平掉")
-    check(len(client.market_closes) == 1, "无保护孤儿持仓触发市价平仓")
-    check(client.positions["BTCUSDT"] == 0.0, "市价平仓后交易所无持仓")
+    retryable = set()
+    reconcile_live_positions(trader, positions, risk, blocked, lambda: None,
+                             retryable=retryable)
+    check(positions["BTCUSDT"] is None, "无保护的手动单不认领进 state")
+    check(len(client.market_closes) == 0, "无保护的手动单不市价平仓")
+    check(client.positions["BTCUSDT"] == -0.02, "手动单还留在交易所")
+    check("BTCUSDT" in blocked, "手动单所在币种暂停新开单")
+    check("BTCUSDT" in retryable, "手动单所在币种进重试队列")
+
+
+def test_reconcile_manual_position_resumes_after_close():
+    """手动单平掉后，下次对账自动解除暂停、恢复该币种交易。"""
+    client, trader = make_trader(auto_fill_entry=True)
+    client.positions["BTCUSDT"] = -0.02
+    client.entries["BTCUSDT"] = 70000.0
+    positions = {"BTCUSDT": None, "ETHUSDT": None}
+    risk = RiskManager(["BTCUSDT", "ETHUSDT"])
+    blocked = set()
+    retryable = set()
+    reconcile_live_positions(trader, positions, risk, blocked, lambda: None,
+                             retryable=retryable)
+    check("BTCUSDT" in blocked, "手动单在时暂停新开单")
+    client.positions["BTCUSDT"] = 0.0
+    reconcile_live_positions(trader, positions, risk, blocked, lambda: None,
+                             retryable=retryable)
+    check("BTCUSDT" not in blocked, "手动单平掉后解除暂停")
+    check("BTCUSDT" not in retryable, "手动单平掉后退出重试队列")
+    check(positions["BTCUSDT"] is None, "恢复后仍是空仓")
 
 
 def test_reconcile_closed_while_down():
@@ -875,8 +904,9 @@ def test_reconcile_retry_unblocks_after_transient_failure():
     check("BTCUSDT" not in retryable, "重试成功：BTC 移出可重试")
 
 
-def test_reconcile_hard_failure_not_retryable():
-    """裸仓市价平仓也失败（交易所仍有持仓）：暂停但不进可重试，等人工处理。"""
+def test_reconcile_manual_position_retryable_despite_close_failure():
+    """2026-11-20 新规则：记录外持仓当手动单，不市价平仓——即使市价平仓
+    接口本身也坏了，也不影响：该币种暂停并进重试队列，等手动单平掉恢复。"""
     client, trader = make_trader(auto_fill_entry=True)
     client.positions["BTCUSDT"] = -0.02
     client.entries["BTCUSDT"] = 70000.0
@@ -887,8 +917,10 @@ def test_reconcile_hard_failure_not_retryable():
     retryable = set()
     reconcile_live_positions(trader, positions, risk, blocked, lambda: None,
                              retryable=retryable)
-    check("BTCUSDT" in blocked, "硬失败：BTC 暂停新开单")
-    check("BTCUSDT" not in retryable, "硬失败：BTC 不进可重试（等人工处理）")
+    check(positions["BTCUSDT"] is None, "手动单不认领进 state")
+    check(len(client.market_closes) == 0, "手动单不市价平仓")
+    check("BTCUSDT" in blocked, "手动单所在币种暂停新开单")
+    check("BTCUSDT" in retryable, "手动单所在币种进重试队列（等手动单平掉恢复）")
 
 
 # ---------- -1106 回归：双向持仓模式下不许带 reduceOnly ----------
@@ -1102,9 +1134,9 @@ def test_breakeven_moves_algo_stop():
         restore_gate(saved)
 
 
-def test_reconcile_orphan_with_algo_stop():
-    """启动对账（新版库）：孤儿持仓的止损在 algo 挂单列表里，要认领而不是
-    当成裸仓市价平掉；双向模式下的止盈（无 reduceOnly）也要认出来。"""
+def test_reconcile_orphan_with_algo_stop_not_touched():
+    """2026-11-20 用户决定：记录外的持仓即使止损在 algo 挂单列表里，
+    也一律当手动单，不认领、不重挂、不平仓。"""
     client, trader = make_trader(auto_fill_entry=True)
     client.algo_routing = True
     client.positions["BTCUSDT"] = -0.02
@@ -1118,15 +1150,17 @@ def test_reconcile_orphan_with_algo_stop():
     positions = {"BTCUSDT": None, "ETHUSDT": None}
     risk = RiskManager(["BTCUSDT", "ETHUSDT"])
     blocked = set()
-    reconcile_live_positions(trader, positions, risk, blocked, lambda: None)
-    pos = positions["BTCUSDT"]
-    check(pos is not None and pos.get("orphan") is True, "algo 回归：孤儿持仓被认领")
-    check(pos["sl_order_id"] == sl["algoId"], "algo 回归：认领了 algo 止损单")
-    check(pos["tp_order_id"] == tp["orderId"], "algo 回归：认领了无 reduceOnly 的止盈单")
-    check(abs(pos["stop_loss"] - 70600.0) < 1e-9 and abs(pos["take_profit"] - 69100.0) < 1e-9,
-          "algo 回归：认领后止损止盈价正确")
-    check(len(client.market_closes) == 0, "algo 回归：有保护的孤儿持仓不市价平仓")
-    check("BTCUSDT" not in blocked, "algo 回归：认领后不暂停该币种")
+    retryable = set()
+    reconcile_live_positions(trader, positions, risk, blocked, lambda: None,
+                             retryable=retryable)
+    check(positions["BTCUSDT"] is None, "algo 回归：手动单不认领进 state")
+    check(len(client.market_closes) == 0, "algo 回归：手动单不市价平仓")
+    check(client.algo_orders[sl["algoId"]]["algoStatus"] != "CANCELED",
+          "algo 回归：手动单的 algo 止损不撤")
+    check(client.orders[tp["orderId"]]["status"] != "CANCELED",
+          "algo 回归：手动单的止盈不撤")
+    check("BTCUSDT" in blocked, "algo 回归：手动单所在币种暂停新开单")
+    check("BTCUSDT" in retryable, "algo 回归：手动单所在币种进重试队列")
 
 
 def test_reconcile_cancels_stray_algo_orders():
@@ -1298,8 +1332,9 @@ if __name__ == "__main__":
     test_live_close_pnl_math()
     test_fetch_fees_failure_returns_none()
     test_rounding()
-    test_reconcile_orphan_position()
-    test_reconcile_orphan_without_protection_market_closes()
+    test_reconcile_orphan_position_not_touched()
+    test_reconcile_orphan_without_protection_not_touched()
+    test_reconcile_manual_position_resumes_after_close()
     test_reconcile_closed_while_down()
     test_reconcile_cancels_stray_orders()
     test_recv_window_sent()
@@ -1311,7 +1346,7 @@ if __name__ == "__main__":
     test_maker_retry_price_has_buffer()
     test_reconcile_fetch_failure_blocks_but_retryable()
     test_reconcile_retry_unblocks_after_transient_failure()
-    test_reconcile_hard_failure_not_retryable()
+    test_reconcile_manual_position_retryable_despite_close_failure()
     test_market_close_hedge_mode_no_reduce_only()
     test_market_close_oneway_mode_has_reduce_only()
     test_market_close_1106_retries_without_reduce_only()
@@ -1325,7 +1360,7 @@ if __name__ == "__main__":
     test_stop_failure_market_closes_algo_routing()
     test_stop_loss_detected_via_algo_order()
     test_breakeven_moves_algo_stop()
-    test_reconcile_orphan_with_algo_stop()
+    test_reconcile_orphan_with_algo_stop_not_touched()
     test_reconcile_cancels_stray_algo_orders()
     test_reconcile_closed_while_down_by_algo_stop()
     test_stop_missing_when_algo_canceled_alerts_only()

@@ -54,8 +54,6 @@ from config import (
     ATR_PERIOD,
     CONSERVATIVE_DAILY_LOSS_USDT,
     CROSS_MODE_ENABLED,
-    CROSS_SL_POINTS,
-    CROSS_TP_POINTS,
     DATA_BASE_URL,
     DRY_RUN,
     EMA_TREND_PERIOD,
@@ -977,9 +975,9 @@ def reconcile_live_positions(live_trader: LiveTrader, positions: dict,
     - 交易所和 state 都有：以交易所的数量/入场价为准；止损/止盈订单丢了不重挂、
       不平仓（2026-11-19 教训：可能是用户手动取消），大声记一笔，持仓继续由用户管理。
       孤儿持仓（state 里没有）才按策略重建保护。
-    - 交易所里有、state 里没有（孤儿持仓）：绝不能丢。先从挂单里找止损/止盈认领；
-      缺哪条按策略从另一条反推重建（旧模式止盈 = 1.5 倍止损距离；交叉模式用固定点数）；
-      两条都没有就立刻市价平仓。认领后该币种随持仓自动停新单（每币种最多 1 单）。
+    - 交易所里有、state 里没有（疑似手动单）：机器人一律不碰——不认领、不重建保护、
+      不平仓（2026-11-20 用户决定；此前按旧规则市价平掉过用户手动单）。
+      该币种暂停新开单并进重试队列，手动单平掉后下次对账自动恢复。
     - 交易所和 state 都没有，但有挂单：多余挂单全撤掉，免得以后意外成交。
     对账本身拉不到交易所状态：该币种加进 blocked，暂停新开单，同时记进 retryable，
     主循环定期重试，成功自动解除。市价平仓也失败（交易所仍有持仓）才需人工处理，
@@ -1088,16 +1086,18 @@ def reconcile_live_positions(live_trader: LiveTrader, positions: dict,
                          and (o.get("reduceOnly") in ("true", True)
                               or o.get("positionSide") == side)), None)
         if saved is None:
-            log(f"严重：交易所里 {symbol} 有持仓 {side} {qty:.5f} @ {entry:.1f}，但 state.json 里没有！"
-                f"已认领并接管，绝不丢单。")
-        position = dict(saved) if saved else {
-            "side": side, "entry": entry, "qty": qty,
-            "margin": qty * entry / LEVERAGE if entry else 0.0,
-            "stop_loss": 0.0, "take_profit": 0.0,
-            "breakeven_done": False, "opened_at": time.time(), "atr": None,
-            "live": True, "orphan": True,
-            "entry_order_id": None, "sl_order_id": None, "tp_order_id": None,
-        }
+            # 2026-11-20 用户决定：交易所里有、state 里没有的持仓一律当手动单，
+            # 机器人不碰、不平仓、不重挂保护。2026-11-20 20:45 启动对账曾按旧规则
+            # 市价平掉用户手动 BTC 多单 0.016 @61468（约 +1.8U），此后不再发生。
+            # 该币种暂停新开单并进重试队列；手动单平掉后下次对账自动恢复。
+            log(f"严重：交易所里 {symbol} 有持仓 {side} {qty:.5f} @ {entry:.1f}，"
+                f"但 state.json 里没有——疑似手动单，机器人不碰、不平仓、不重挂保护；"
+                f"该币种暂停新开单，等手动单平掉再恢复。")
+            blocked.add(symbol)
+            if retryable is not None:
+                retryable.add(symbol)
+            continue
+        position = dict(saved)
         position.update({"side": side, "qty": qty, "entry": entry, "live": True})
         if sl_order is not None:
             position["sl_order_id"] = sl_order["orderId"]
@@ -1108,72 +1108,22 @@ def reconcile_live_positions(live_trader: LiveTrader, positions: dict,
         # 止损已在成本价上 = 保本早已触发，别让主循环再撤单重挂一次
         if sl_order is not None and abs(position["stop_loss"] - entry) < 1e-9:
             position["breakeven_done"] = True
-        # 缺保护单：分两种。孤儿持仓（state 里没有，用户意图未知）按策略重建保护；
-        # 已记录的持仓不重挂、不平仓——2026-11-19 教训：ETH 的止损就是用户自己取消的，
+        # 缺保护单：已记录的持仓不重挂、不平仓——2026-11-19 教训：ETH 的止损就是用户自己取消的，
         # 重挂等于跟用户对着干，平仓等于替用户平了他自己在管的单。
-        need_close = False
+        # state 里没有的持仓上面已当手动单直接跳过，不会走到这里。
         if sl_order is None and tp_order is not None:
-            if saved is None:
-                if CROSS_MODE_ENABLED:
-                    sl_dist = CROSS_SL_POINTS.get(symbol, 1000.0)
-                    sl = entry - sl_dist if side == "LONG" else entry + sl_dist
-                else:
-                    tp_dist = abs(position["take_profit"] - entry)
-                    sl = entry - tp_dist / 1.5 if side == "LONG" else entry + tp_dist / 1.5
-                try:
-                    position["sl_order_id"] = live_trader.place_stop(symbol, side, sl)
-                    position["stop_loss"] = sl
-                    log(f"对账：{symbol} 止损单丢了，按止盈反推重挂止损 {sl:.1f}。")
-                except Exception as e:  # noqa: BLE001
-                    log(f"严重：{symbol} 重挂止损失败（{e}），立刻市价平仓。")
-                    need_close = True
-            else:
-                position["sl_order_id"] = None
-                log(f"严重：{symbol} 止损单不在交易所（可能手动取消），当前无止损保护，"
-                    f"持仓继续由用户管理，不重挂。原止损价 {position['stop_loss']:.1f} 仅作显示。")
-        if tp_order is None and sl_order is not None and not need_close:
-            if saved is None:
-                if CROSS_MODE_ENABLED:
-                    tp_dist = CROSS_TP_POINTS.get(symbol, 200.0)
-                    tp = entry + tp_dist if side == "LONG" else entry - tp_dist
-                else:
-                    sl_dist = abs(position["stop_loss"] - entry)
-                    tp = entry + sl_dist * 1.5 if side == "LONG" else entry - sl_dist * 1.5
-                try:
-                    position["tp_order_id"] = live_trader.place_take_profit(symbol, side, qty, tp)
-                    position["take_profit"] = tp
-                    log(f"对账：{symbol} 止盈单丢了，按止损反推重挂止盈 {tp:.1f}。")
-                except Exception as e:  # noqa: BLE001
-                    log(f"严重：{symbol} 重挂止盈失败（{e}），立刻市价平仓。")
-                    need_close = True
-            else:
-                position["tp_order_id"] = None
-                log(f"严重：{symbol} 止盈单不在交易所（可能手动取消），当前无止盈单，"
-                    f"持仓继续由用户管理，不重挂。原止盈价 {position['take_profit']:.1f} 仅作显示。")
+            position["sl_order_id"] = None
+            log(f"严重：{symbol} 止损单不在交易所（可能手动取消），当前无止损保护，"
+                f"持仓继续由用户管理，不重挂。原止损价 {position['stop_loss']:.1f} 仅作显示。")
+        if tp_order is None and sl_order is not None:
+            position["tp_order_id"] = None
+            log(f"严重：{symbol} 止盈单不在交易所（可能手动取消），当前无止盈单，"
+                f"持仓继续由用户管理，不重挂。原止盈价 {position['take_profit']:.1f} 仅作显示。")
         if sl_order is None and tp_order is None:
-            if saved is None:
-                log(f"严重：{symbol} 交易所持仓没有任何保护单（裸仓），立刻市价平仓。")
-                need_close = True
-            else:
-                position["sl_order_id"] = None
-                position["tp_order_id"] = None
-                log(f"严重：{symbol} 交易所持仓没有任何保护单（疑似手动取消），"
-                    f"持仓继续由用户管理，不平仓。")
-        if need_close:
-            try:
-                live_trader.market_close(symbol, side, qty)
-                log(f"对账：已市价平掉 {symbol} {side} qty={qty:.5f}。")
-            except Exception as e:  # noqa: BLE001
-                log(f"严重！！{symbol} 对账市价平仓也失败：{e}。交易所仍有持仓，请立即人工处理；"
-                    f"该币种已暂停新开单。")
-                blocked.add(symbol)
-                continue
-            if saved is not None:
-                pnl = close_pnl(saved, st["mark"] or entry, exit_is_maker=False)
-                risk.record_trade_closed(symbol, pnl, was_sl=False, now=time.time())
-            positions[symbol] = None
-            save_state()
-            continue
+            position["sl_order_id"] = None
+            position["tp_order_id"] = None
+            log(f"严重：{symbol} 交易所持仓没有任何保护单（疑似手动取消），"
+                f"持仓继续由用户管理，不平仓。")
         positions[symbol] = position
         save_state()
         protect_note = ""
@@ -1330,7 +1280,7 @@ def main() -> None:
             last_reconcile_retry = now
             retry_syms = sorted(s for s in live_blocked_retryable if s in live_blocked)
             if retry_syms:
-                log(f"对账重试：{', '.join(retry_syms)} 启动对账失败，重新拉交易所状态。")
+                log(f"对账重试：{', '.join(retry_syms)}，重新拉交易所状态。")
                 reconcile_live_positions(live_trader, positions, risk, live_blocked,
                                          save_state, symbols=retry_syms,
                                          retryable=live_blocked_retryable)
@@ -1340,7 +1290,7 @@ def main() -> None:
                         log(f"对账重试成功：{s} 已解除暂停，可正常开单。")
                 still = [s for s in retry_syms if s in live_blocked]
                 if still:
-                    log(f"对账重试仍失败：{', '.join(still)}，"
+                    log(f"对账重试：{', '.join(still)} 仍暂停（拉不到状态或有手动单），"
                         f"{RECONCILE_RETRY_SECONDS // 60} 分钟后再试。")
 
         for symbol in SYMBOLS:
