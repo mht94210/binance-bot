@@ -1178,13 +1178,16 @@ def main() -> None:
             log("UTC 日期已变，当日计数自动清零，继续交易。")
             save_state()
 
-        if risk.should_stop_for_day():
+        # 熔断只拦新开单，不停持仓管理（2026-11-20 修：原来 sleep 60 秒后 continue，
+        # 跳过整个循环，持仓没人管——ETH 多 @1787.0 就是这么在熔断期跌穿止损没人平，
+        # 午夜恢复后才在 1757.3 出场，亏了 -86.53U，超过 60U 单笔上限）。
+        fused = risk.should_stop_for_day()
+        if fused:
             if not halted_logged:
-                log(f"今日净亏损已达 {risk.daily_loss_limit:.0f} U 熔断，停手，等 UTC 午夜自动清零。")
+                log(f"今日净亏损已达 {risk.daily_loss_limit:.0f} U 熔断，停新开单，等 UTC 午夜自动清零。")
                 halted_logged = True
-            time.sleep(60)
-            continue
-        halted_logged = False
+        else:
+            halted_logged = False
 
         now = time.time()
         any_holding = False
@@ -1273,6 +1276,9 @@ def main() -> None:
                 continue
 
             # ---------- 无持仓：实时判断，不等 5 分钟 K 线收盘 ----------
+            # 熔断只拦新开单：空仓币种跳过信号判断（持仓币种走上面的持仓分支，照常管理）。
+            if fused:
+                continue
             # 实时信号（2026-11-16 用户决定，解决进场晚）：同一根未收盘 K 线每 60 秒
             # 重新判断一次；没信号时只在新 K 线才记日志，免得刷屏。
             # 持仓时主循环 5 秒一轮，空仓币种不能每 5 秒拉 3 组 K 线：60 秒最多判断一次。

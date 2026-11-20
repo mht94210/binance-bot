@@ -1,14 +1,14 @@
 """剥头皮测试版规则回归（放在仓库里，虚拟机重启也不丢）。
 
 和德国实盘版的区别只有五处（用户 2026-11-17 决定：先做模拟盘版本测几天，放日本服务器跑）：
-A) 止损 3 倍 ATR（放远了，不会被噪音突然打掉；实盘版是 2 倍）
+A) 止损 1.5 倍 ATR（用户 2026-11-20 决定：3 倍止损太大，收紧到 1.5 倍；实盘版是 2 倍）
 B) 止盈不再按 ATR：浮盈扣掉全部手续费，净赚 15U 就平（止盈价按仓位反推）
 C) 每天每币上限 50 单（用户目标一天 100 单；模拟盘测试，额度不做瓶颈）
 D) 每单固定 500U 保证金（用户 2026-11-18 决定：500U 快进快出方案；10 倍杠杆 = 5000U 名义仓位；仓位不再按风险倒推）
 E) 简化信号（用户 2026-11-17 决定：均线定方向 + 2/3 票就开）：方向只看 5 分钟 MA5/MA20，
    三个投票（均线/分界线/量能）里 2 票就开；不要三模式、不要 ADX、不要 EMA50、
    不要过度延伸过滤（原来三模式 + 3/3 全票太严，200U 版上线 1 小时一单没开）
-其余照抄实盘版；冷却改过三次（2026-11-17 用户决定：同方向 3/3 不跳过冷却；平仓后冷却 15 分钟改 10 分钟；止损后反向直接进），熔断、保本逻辑不动。
+其余照抄实盘版；冷却改过三次（2026-11-17 用户决定：同方向 3/3 不跳过冷却；平仓后冷却 15 分钟改 10 分钟；止损后反向直接进），熔断 2026-11-20 改过一次（只拦新开单，持仓照常管理），保本逻辑不动。
 
 用法：python3 tests/test_scalp_rules.py
 """
@@ -63,18 +63,18 @@ def net_pnl_at(side, entry, qty, exit_price, exit_is_maker):
 # ---------- 0) 信号周期 5 分钟 ----------
 check(SIGNAL_INTERVAL == "5m", "0 信号周期 5 分钟")
 
-# ---------- A) 止损 3 倍 ATR ----------
+# ---------- A) 止损 1.5 倍 ATR ----------
 sig_s = evaluate(**base_kwargs())
 check(sig_s is not None and sig_s["side"] == "SHORT",
       "A 做空信号触发（均线向下 + 2/3 票）")
-check(sig_s is not None and abs(sig_s["stop_loss"] - sig_s["entry"]) == 3 * 242.0,
-      "A 止损 = 3 倍 ATR（726 点）")
+check(sig_s is not None and abs(sig_s["stop_loss"] - sig_s["entry"]) == 1.5 * 242.0,
+      "A 止损 = 1.5 倍 ATR（363 点）")
 sig_l = evaluate(**long_kwargs())
 check(sig_l is not None and sig_l["side"] == "LONG",
       "A 做多信号触发（均线向上 + 2/3 票）")
-check(sig_l is not None and abs(sig_l["entry"] - sig_l["stop_loss"]) == 3 * 242.0,
-      "A 做多止损也是 3 倍 ATR")
-check(SL_ATR_MULT == 3.0, "A SL_ATR_MULT = 3.0")
+check(sig_l is not None and abs(sig_l["entry"] - sig_l["stop_loss"]) == 1.5 * 242.0,
+      "A 做多止损也是 1.5 倍 ATR")
+check(SL_ATR_MULT == 1.5, "A SL_ATR_MULT = 1.5")
 
 # ---------- B) 止盈净赚 15U（扣掉全部手续费）----------
 check(SCALP_NET_TP_USDT == 15.0, "B SCALP_NET_TP_USDT = 15.0")
@@ -85,9 +85,11 @@ check(abs(pnl_s - 15.0) < 0.01, f"B 做空到止盈价净赚 15U（算出 {pnl_s
 qty_l = position_qty(sig_l["entry"], sig_l["stop_loss"])
 pnl_l = net_pnl_at("LONG", sig_l["entry"], qty_l, sig_l["take_profit"], True)
 check(abs(pnl_l - 15.0) < 0.01, f"B 做多到止盈价净赚 15U（算出 {pnl_l:+.2f}U）")
-# 止盈价离入场很近（远小于止损距离），才配叫剥头皮
-check(abs(sig_s["take_profit"] - sig_s["entry"]) < (1.0/3.0) * abs(sig_s["stop_loss"] - sig_s["entry"]),
-      "B 止盈距离 < 止损距离的 1/3")
+# 止盈价离入场不远（小于止损距离的 2/3；止损收紧到 1.5 倍 ATR 后，止盈 15U 的
+# 距离约为止损的 60%，不再是 3 倍 ATR 时的 1/3——这是收紧止损的直接代价，保本胜率
+# 要求从 79% 降到约 67%，见 2026-11-20 给用户的分析）
+check(abs(sig_s["take_profit"] - sig_s["entry"]) < (2.0/3.0) * abs(sig_s["stop_loss"] - sig_s["entry"]),
+      "B 止盈距离 < 止损距离的 2/3")
 check("净赚 15U" in sig_s["reason"] and "净赚 15U" in sig_l["reason"],
       "B 信号原因写明止盈净赚 15U")
 # 公式本身：BTC 做多 64500、数量 0.01375，止盈约 65616.9（15U 版；5U 版是 64889.5）
@@ -95,10 +97,11 @@ tp_formula = scalp_tp_price(64500.0, "LONG", 0.01375)
 check(abs(tp_formula - 65616.9) < 1.0, f"B 公式算做多止盈约 65616.9（算出 {tp_formula:.1f}）")
 tp_formula_s = scalp_tp_price(64500.0, "SHORT", 0.01375)
 check(abs(tp_formula_s - 63383.5) < 1.0, f"B 公式算做空止盈约 63383.5（算出 {tp_formula_s:.1f}）")
-# 止损出场是市价单（taker 费），固定 500U 保证金后一单净亏约 59.8U——
-# 仓位比风险倒推时大（BTC 0.0775 对 0.0138），亏满也更大；写进测试免得以后有人偷偷改小
+# 止损出场是市价单（taker 费），固定 500U 保证金、止损 1.5 倍 ATR 后一单净亏约 31.7U
+# （3 倍 ATR 时约 59.8U）；仓位比风险倒推时大（BTC 0.0775 对 0.0138），亏满也更大；
+# 写进测试免得以后有人偷偷改小
 pnl_sl = net_pnl_at("SHORT", sig_s["entry"], qty_s, sig_s["stop_loss"], False)
-check(-61.0 < pnl_sl < -59.0, f"B 止损出场净亏约 59.8U（算出 {pnl_sl:+.2f}U）")
+check(-33.0 < pnl_sl < -30.0, f"B 止损出场净亏约 31.7U（算出 {pnl_sl:+.2f}U）")
 
 # ---------- B2) 手续费地板不启用：ATR 再小也不挡信号 ----------
 sig_tiny = evaluate(**base_kwargs(atr=1.0))
@@ -109,8 +112,8 @@ check(MAX_TRADES_PER_DAY == 50, "C MAX_TRADES_PER_DAY = 50")
 
 # ---------- D) 仓位：每单固定 500U 保证金（用户 2026-11-18 决定：500U 快进快出方案）----------
 risk = RiskManager(["BTCUSDT", "ETHUSDT"])
-qty, margin, max_loss = risk.size_position(64500.0, 64500.0 + 726.0)
-check(margin == 500.0, f"D 3 倍 ATR 仓位保证金固定 500U（算出 {margin:.1f}U）")
+qty, margin, max_loss = risk.size_position(64500.0, 64500.0 + 363.0)
+check(margin == 500.0, f"D 1.5 倍 ATR 仓位保证金固定 500U（算出 {margin:.1f}U）")
 check(max_loss < 60.0, f"D 预期最大亏损 < 60U 上限（算出 {max_loss:.2f}U）")
 qty2, margin2, _ = risk.size_position(64500.0, 64490.0)
 check(margin2 == 500.0, f"D 止损很近时保证金仍是固定 500U，不再封顶（算出 {margin2:.1f}U）")
@@ -171,6 +174,18 @@ risk_f3 = RiskManager(["ETHUSDT"])
 risk_f3.restore_state(_st)
 ok_restored, _ = risk_f3.can_trade("ETHUSDT", now=_t0 + 5, votes=3, side="SHORT")
 check(not ok_restored, "F state.json 恢复后同方向冷却仍生效")
+
+# ---------- G) 熔断只拦新开单：风控层已挡，持仓管理不在风控里 ----------
+# 背景（2026-11-20）：UTC 11-19 日本 ETH 多 @1787.0 熔断期间跌穿止损没人平，
+# 午夜恢复后才在 1757.3 出场，亏 -86.53U。根因是 main.py 主循环熔断分支 sleep 60 秒
+# 后 continue，跳过整个循环（含持仓管理）。修：熔断只跳过新开单判断，持仓分支照常走。
+# 循环结构无法在这文件里单测，风控层的关口（can_trade 熔断时拒绝）测在这里。
+_t1 = 1794906000.0  # 2026-11-17 09:00 UTC，不在大消息窗口里
+risk_g = RiskManager(["BTCUSDT"])
+risk_g.record_trade_closed("BTCUSDT", -100.0, was_sl=True, now=_t1, side="SHORT")
+check(risk_g.should_stop_for_day(), "G 当日净亏 100U 触发熔断")
+ok_g, _ = risk_g.can_trade("BTCUSDT", now=_t1 + 60, votes=3, side="LONG")
+check(not ok_g, "G 熔断时新开单被挡（3/3 也不放行）")
 
 # ---------- 模拟盘开关：config.json 明确关实盘 ----------
 cfg = json.loads((Path(__file__).resolve().parent.parent / "config.json").read_text(encoding="utf-8"))
