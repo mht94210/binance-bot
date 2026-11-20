@@ -14,6 +14,8 @@ A) 少而精：3/3 全票、保证金 400U、5m 信号/ATR；2026-11-16 去掉 E
    （现价离 EMA50 不超过 1 倍 ATR 才进，太远等回踩；回测挡住 3 个空，2 个多不受影响）
    2026-11-20 用户决定（趋势新版 0 胜 6 负 -79.53U，距离门拦不住）：趋势模式先停，只做震荡
    （TREND_MODE_ENABLED=False：1h ADX>=25 或拿不到都返回 paused，不开单；只有 <25 才走 range）
+   2026-11-20 用户决定（趋势/震荡都不赚钱）：全部停用，改成均线交叉模式——5m 收盘 MA5 上穿 MA20
+   做多、下穿做空；固定点数止盈止损 BTC 200/1000 点、ETH 6/28 点；每单 300U；单笔上限 60U
 B) 放宽止损：趋势/动量止损 2 倍 ATR、止盈 3 倍 ATR、盈亏比 1:1.5
 C) 冷却跳过：3/3 强信号跳过冷却；连亏暂停/消息禁入/每日熔断是硬刹车
 D) 熔断：日熔断 100U；state.json 丢失时收紧到 50U；UTC 午夜恢复 100U
@@ -260,22 +262,23 @@ def test_direction_from_5m():
           "A 两边都不足 3/3 票时挡住")
 
 
-def test_fixed_margin_200():
+def test_fixed_margin_300():
     # 2026-11-17 用户决定：每单固定 200U 保证金（名义 2000U），不再按固定 10U 风险倒推仓位。
+    # 2026-11-20 用户决定：提到 300U（名义 3000U）；单笔上限 40U -> 60U。
     rm = RiskManager(["BTCUSDT", "ETHUSDT"])
     qty, margin, max_loss = rm.size_position(entry=64885.0, stop_loss=64885.0 - 460.0)
-    check(abs(margin - 200.0) < 0.01, f"F 保证金固定 200U（实得 {margin:.1f}U）")
-    check(abs(qty - 2000.0 / 64885.0) < 1e-9, f"F BTC 数量 = 2000/64885（实得 {qty:.5f}）")
-    check(abs(max_loss - (qty * 460.0 + 2000.0 * 0.0007)) < 0.01,
-          f"F BTC 止损 460 点预期最大亏损约 15.6U（实得 {max_loss:.2f}U）")
-    check(max_loss < 40.0, "F BTC 单笔最大亏损 < 40U")
+    check(abs(margin - 300.0) < 0.01, f"F 保证金固定 300U（实得 {margin:.1f}U）")
+    check(abs(qty - 3000.0 / 64885.0) < 1e-9, f"F BTC 数量 = 3000/64885（实得 {qty:.5f}）")
+    check(abs(max_loss - (qty * 460.0 + 3000.0 * 0.0007)) < 0.01,
+          f"F BTC 止损 460 点预期最大亏损约 23.4U（实得 {max_loss:.2f}U）")
+    check(max_loss < 60.0, "F BTC 单笔最大亏损 < 60U")
     qty2, margin2, max_loss2 = rm.size_position(entry=1815.0, stop_loss=1815.0 - 17.0)
-    check(abs(margin2 - 200.0) < 0.01, f"F ETH 保证金固定 200U（实得 {margin2:.1f}U）")
-    check(max_loss2 < 40.0, f"F ETH 单笔最大亏损 {max_loss2:.2f}U < 40U")
-    # 止损距离过大（3%）预期亏损超 40U：放弃这单
+    check(abs(margin2 - 300.0) < 0.01, f"F ETH 保证金固定 300U（实得 {margin2:.1f}U）")
+    check(max_loss2 < 60.0, f"F ETH 单笔最大亏损 {max_loss2:.2f}U < 60U")
+    # 止损距离过大（3%）预期亏损超 60U：放弃这单
     qty3, margin3, max_loss3 = rm.size_position(entry=100.0, stop_loss=97.0)
-    check(qty3 == 0.0 and margin3 == 0.0, f"F 止损 3% 预期亏损 {max_loss3:.1f}U 超 40U 上限，放弃（数量 {qty3}）")
-    check(max_loss3 > 40.0, "F 超限时返回的预期亏损 > 40U")
+    check(qty3 == 0.0 and margin3 == 0.0, f"F 止损 3% 预期亏损 {max_loss3:.1f}U 超 60U 上限，放弃（数量 {qty3}）")
+    check(max_loss3 > 60.0, "F 超限时返回的预期亏损 > 60U")
 
 
 def test_atr5_sl_tp():
@@ -330,7 +333,10 @@ def test_signal_timeframe_5m():
         exp_mid = (max(k["high"] for k in win12) + min(k["low"] for k in win12)) / 2
         check(abs(ind["midline"] - exp_mid) < 1e-9,
               f"A 分界线 = 最后 12 根高低中点（实得 {ind['midline']:.1f}，预期 {exp_mid:.1f}）")
-        check(ind["mode"] == "range", f"A 1h ADX 小 -> range 模式（实得 {ind['mode']}）")
+        # 2026-11-20 用户决定：交叉模式接管，不看 1h ADX，模式恒为 cross。
+        check(ind["mode"] == "cross", f"A 交叉模式：1h ADX 再小也是 cross（实得 {ind['mode']}）")
+        check(ind["ma_fast_closed"] is not None and ind["ma_fast_prev"] is not None,
+              "A 交叉模式：收盘均线（最新/上一根）都算得出来")
 
 
 # ---------- B) 放宽止损 ----------
@@ -427,6 +433,67 @@ def test_constants():
     check(MAX_DAILY_LOSS_USDT == 100.0, f"常量日熔断 100U（实得 {MAX_DAILY_LOSS_USDT}）")
 
 
+# ---------- G) 均线交叉模式（2026-11-20 用户决定：趋势/震荡全部停用）----------
+def test_cross_mode():
+    from config import (
+        CROSS_MODE_ENABLED,
+        CROSS_SL_POINTS,
+        CROSS_TP_POINTS,
+        FIXED_MARGIN_PER_TRADE_USDT,
+        MAX_LOSS_PER_TRADE_USDT,
+    )
+    check(CROSS_MODE_ENABLED is True, "G 交叉模式开关开着")
+    check(CROSS_TP_POINTS == {"BTCUSDT": 200.0, "ETHUSDT": 6.0},
+          f"G 交叉止盈点数 BTC 200 / ETH 6（实得 {CROSS_TP_POINTS}）")
+    check(CROSS_SL_POINTS == {"BTCUSDT": 1000.0, "ETHUSDT": 28.0},
+          f"G 交叉止损点数 BTC 1000 / ETH 28（实得 {CROSS_SL_POINTS}）")
+    check(FIXED_MARGIN_PER_TRADE_USDT == 300.0, "G 每单固定 300U 保证金")
+    check(MAX_LOSS_PER_TRADE_USDT == 60.0, "G 单笔上限 60U")
+    # 上穿做多：BTC 入场 61500，止盈 +200、止损 -1000
+    sig = evaluate(price=61500.0, atr=135.0, adx15=30.0, ma_fast=61550.0, ma_slow=61540.0,
+                   midline=None, volume=None, volume_sma=None,
+                   mode="cross", symbol="BTCUSDT", ma_fast_prev=61530.0, ma_slow_prev=61540.0)
+    check(sig is not None and sig["side"] == "LONG", "G MA5 上穿 MA20 做多")
+    check(abs(sig["take_profit"] - 61700.0) < 0.01, f"G BTC 止盈 61500+200（实得 {sig['take_profit']:.1f}）")
+    check(abs(sig["stop_loss"] - 60500.0) < 0.01, f"G BTC 止损 61500-1000（实得 {sig['stop_loss']:.1f}）")
+    check(sig["mode"] == "cross", "G 信号模式 cross")
+    # 下穿做空
+    sig2 = evaluate(price=61500.0, atr=135.0, adx15=30.0, ma_fast=61530.0, ma_slow=61540.0,
+                    midline=None, volume=None, volume_sma=None,
+                    mode="cross", symbol="BTCUSDT", ma_fast_prev=61550.0, ma_slow_prev=61540.0)
+    check(sig2 is not None and sig2["side"] == "SHORT", "G MA5 下穿 MA20 做空")
+    check(abs(sig2["take_profit"] - 61300.0) < 0.01, f"G BTC 做空止盈 61500-200（实得 {sig2['take_profit']:.1f}）")
+    check(abs(sig2["stop_loss"] - 62500.0) < 0.01, f"G BTC 做空止损 61500+1000（实得 {sig2['stop_loss']:.1f}）")
+    # 没交叉不开单（一直多头也不追）
+    sig3 = evaluate(price=61500.0, atr=135.0, adx15=30.0, ma_fast=61550.0, ma_slow=61540.0,
+                    midline=None, volume=None, volume_sma=None,
+                    mode="cross", symbol="BTCUSDT", ma_fast_prev=61545.0, ma_slow_prev=61540.0)
+    check(sig3 is None, "G 没交叉不开单")
+    # ETH 点数：入场 1740，止盈 +6、止损 -28
+    sig4 = evaluate(price=1740.0, atr=5.4, adx15=30.0, ma_fast=1741.0, ma_slow=1740.5,
+                    midline=None, volume=None, volume_sma=None,
+                    mode="cross", symbol="ETHUSDT", ma_fast_prev=1740.0, ma_slow_prev=1740.5)
+    check(sig4 is not None and sig4["side"] == "LONG", "G ETH 上穿做多")
+    check(abs(sig4["take_profit"] - 1746.0) < 0.01, f"G ETH 止盈 1740+6（实得 {sig4['take_profit']:.1f}）")
+    check(abs(sig4["stop_loss"] - 1712.0) < 0.01, f"G ETH 止损 1740-28（实得 {sig4['stop_loss']:.1f}）")
+    # 手续费地板：BTC 涨到 100000 时 200 点只占 0.20%，低于 0.30% 不做
+    sig5 = evaluate(price=100000.0, atr=135.0, adx15=30.0, ma_fast=100050.0, ma_slow=100040.0,
+                    midline=None, volume=None, volume_sma=None,
+                    mode="cross", symbol="BTCUSDT", ma_fast_prev=100030.0, ma_slow_prev=100040.0)
+    check(sig5 is None, "G 止盈占比低于手续费地板时不开单")
+    # 均线缺失不开单
+    sig6 = evaluate(price=61500.0, atr=135.0, adx15=30.0, ma_fast=61550.0, ma_slow=61540.0,
+                    midline=None, volume=None, volume_sma=None,
+                    mode="cross", symbol="BTCUSDT", ma_fast_prev=None, ma_slow_prev=61540.0)
+    check(sig6 is None, "G 上一根均线缺失不开单")
+    # size_position：BTC 止损 1000 点预期亏损约 51U < 60U，能开；ETH 止损 28 点约 50U，能开
+    rm = RiskManager(["BTCUSDT", "ETHUSDT"])
+    qty, margin, max_loss = rm.size_position(entry=61500.0, stop_loss=60500.0)
+    check(qty > 0 and abs(margin - 300.0) < 0.01, f"G BTC 止损 1000 点能开（预期亏损 {max_loss:.2f}U < 60U）")
+    qty_e, _, max_loss_e = rm.size_position(entry=1740.0, stop_loss=1712.0)
+    check(qty_e > 0, f"G ETH 止损 28 点能开（预期亏损 {max_loss_e:.2f}U < 60U）")
+
+
 if __name__ == "__main__":
     test_votes_3of3_only()
     test_no_adx_gate()
@@ -437,7 +504,8 @@ if __name__ == "__main__":
     test_trend_ema_distance()
     test_range_mode()
     test_direction_from_5m()
-    test_fixed_margin_200()
+    test_fixed_margin_300()
+    test_cross_mode()
     test_atr5_sl_tp()
     test_signal_timeframe_5m()
     test_widen_stop()

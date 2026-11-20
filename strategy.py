@@ -32,6 +32,9 @@
 入场按 Post Only 限价单（maker 手续费），止损按市价单；Dry-Run 下按信号价成交。
 """
 from config import (
+    CROSS_MODE_ENABLED,
+    CROSS_SL_POINTS,
+    CROSS_TP_POINTS,
     EMA_TREND_PERIOD,
     FEE_FLOOR_PCT,
     OVEREXTENSION_ATR_MULT,
@@ -93,13 +96,74 @@ def _votes_short(price: float, ma_fast: float | None, ma_slow: float | None,
     return votes
 
 
+def cross_signal(price: float, ma_fast_prev: float | None, ma_slow_prev: float | None,
+                 ma_fast_now: float | None, ma_slow_now: float | None,
+                 symbol: str, log=None) -> dict | None:
+    """
+    均线交叉模式（2026-11-20 用户决定：趋势/震荡全部停用，改成均线交叉 + 固定点数止盈止损）。
+    只看已收盘 K 线：上一根收盘 MA5 在 MA20 下方、最新收盘 MA5 到 MA20 上方 = 上穿做多；
+    反过来 = 下穿做空。没发生交叉就不开单（均线一直多头/空头时不追单，只等下一次交叉）。
+    止盈止损是固定点数（BTC 200/1000 点，ETH 6/28 点），不看 ATR、ADX、量能、区间位置。
+    反向交叉出现时手里有单不强制平仓，只等止盈/止损出场（冷却与额度由风控器管）。
+    """
+    def _blocked(reason: str):
+        if log is not None:
+            log(f"信号被挡：{reason}")
+        return None
+
+    if ma_fast_prev is None or ma_slow_prev is None or ma_fast_now is None or ma_slow_now is None:
+        return _blocked("均线交叉模式：收盘均线还没算出来（5 分钟 K 线不够），等预热。")
+    tp_points = CROSS_TP_POINTS.get(symbol)
+    sl_points = CROSS_SL_POINTS.get(symbol)
+    if tp_points is None or sl_points is None:
+        return _blocked(f"均线交叉模式：{symbol} 没设固定止盈止损点数，不做。")
+
+    if ma_fast_prev <= ma_slow_prev and ma_fast_now > ma_slow_now:
+        side = "LONG"
+    elif ma_fast_prev >= ma_slow_prev and ma_fast_now < ma_slow_now:
+        side = "SHORT"
+    else:
+        return _blocked("均线交叉模式：5m MA5/MA20 还没交叉，继续等。")
+
+    # 手续费地板：止盈目标 < 0.30% 不做（BTC 200 点约 0.33%、ETH 6 点约 0.34%，刚过线）
+    if tp_points / price < FEE_FLOOR_PCT:
+        return _blocked(f"均线交叉模式：止盈目标只有 {tp_points / price * 100:.2f}%，"
+                        f"低于手续费地板 0.30%，不做。")
+    if side == "LONG":
+        return {
+            "side": "LONG",
+            "entry": price,
+            "stop_loss": price - sl_points,
+            "take_profit": price + tp_points,
+            "take_profit_1": price + tp_points,
+            "take_profit_2": None,
+            "atr": None,
+            "votes": 1,
+            "reason": f"均线交叉模式：5m MA5 上穿 MA20 做多，止盈 {tp_points:.0f} 点、止损 {sl_points:.0f} 点",
+            "mode": "cross",
+        }
+    return {
+        "side": "SHORT",
+        "entry": price,
+        "stop_loss": price + sl_points,
+        "take_profit": price - tp_points,
+        "take_profit_1": price - tp_points,
+        "take_profit_2": None,
+        "atr": None,
+        "votes": 1,
+        "reason": f"均线交叉模式：5m MA5 下穿 MA20 做空，止盈 {tp_points:.0f} 点、止损 {sl_points:.0f} 点",
+        "mode": "cross",
+    }
+
+
 def evaluate(price: float, atr: float | None,
              adx15: float | None, ma_fast: float | None, ma_slow: float | None,
              midline: float | None,
              volume: float | None, volume_sma: float | None,
              range_high: float | None = None, range_low: float | None = None,
              mode: str = "momentum", ema_trend: float | None = None,
-             log=None) -> dict | None:
+             log=None, symbol: str | None = None,
+             ma_fast_prev: float | None = None, ma_slow_prev: float | None = None) -> dict | None:
     """
     实时判断：每 60 秒用当前未收盘的 5 分钟 K 线调用一次。price 是判断时的实时价
     （不是那根 K 线的收盘价，避免入场价滞后）；指标（ATR/ADX/均线/分界线/量能）
@@ -107,7 +171,8 @@ def evaluate(price: float, atr: float | None,
     range_high / range_low 是过去 6 小时区间的最高最低价（不传则不过度延伸过滤，
     range 模式也做不了位置确认）。
     mode 是策略模式（select_mode 按 1 小时 ADX 选出）：trend / momentum / range /
-    paused（趋势已停时，evaluate 直接挡掉不开单）。
+    paused（趋势已停时，evaluate 直接挡掉不开单）；cross 是 2026-11-20 用户决定的
+    均线交叉模式（main.py 在 CROSS_MODE_ENABLED=True 时直接传 mode="cross"，不经过 select_mode）。
     ema_trend 是 5 分钟 EMA50（只 trend 模式用）。
     指标缺失（预热期）时直接返回 None，不过滤也不开单。
     返回信号 dict，或 None（无信号）。信号一定带 stop_loss 和 take_profit。
@@ -132,6 +197,14 @@ def evaluate(price: float, atr: float | None,
         if log is not None:
             log(f"信号被挡：{reason}")
         return None
+
+    # 均线交叉模式（2026-11-20 用户决定）：接管全部信号，趋势/震荡/paused 都不再走；
+    # 只看收盘均线交叉 + 固定点数止盈止损。放在 paused 检查前面——交叉模式下不看 1h ADX。
+    if mode == "cross":
+        if symbol is None:
+            return _blocked("均线交叉模式：没传币种，不知道用哪组固定点数。")
+        return cross_signal(price, ma_fast_prev, ma_slow_prev, ma_fast, ma_slow,
+                            symbol, log=log)
 
     # 趋势模式已停（2026-11-20 用户决定：只做震荡）：paused 下任何信号都不开，
     # 放在预热检查前面——停用期连指标都不用等，直接写明原因。

@@ -53,6 +53,9 @@ from config import (
     ADX_PERIOD,
     ATR_PERIOD,
     CONSERVATIVE_DAILY_LOSS_USDT,
+    CROSS_MODE_ENABLED,
+    CROSS_SL_POINTS,
+    CROSS_TP_POINTS,
     DATA_BASE_URL,
     DRY_RUN,
     EMA_TREND_PERIOD,
@@ -189,7 +192,12 @@ def compute_indicators(symbol: str) -> dict | None:
     # （2026-11-16 用户决定）。1h K 线拿不到时 adx1h 为 None，模式默认 momentum。
     k1h = get_klines(symbol, "1h", 40)
     adx1h_value, _, _ = adx(k1h, ADX_PERIOD) if len(k1h) >= ADX_PERIOD + 1 else (None, None, None)
-    mode = select_mode(adx1h_value)
+    # 均线交叉模式（2026-11-20 用户决定）：不看 1h ADX，直接走 cross；关掉开关才恢复三模式。
+    mode = "cross" if CROSS_MODE_ENABLED else select_mode(adx1h_value)
+    # 均线交叉模式只看已收盘 K 线：ksig[-1] 是未收盘的那根，去掉它再算均线；
+    # 上一根收盘的均线也要，用来判断最新收盘有没有发生交叉。
+    closes_closed = closes[:-1]
+    closes_prev = closes[:-2]
     # trend 模式的方向过滤均线（5 分钟 EMA50）
     ema_trend_value = ema(closes, EMA_TREND_PERIOD)
     # 滚动分界线：最近 12 根 5 分钟 K 线（60 分钟）最高最低价的中点，跟着市场走
@@ -206,6 +214,10 @@ def compute_indicators(symbol: str) -> dict | None:
         "adx15": adx_value,
         "ma_fast": sma(closes, MA_FAST_PERIOD),
         "ma_slow": sma(closes, MA_SLOW_PERIOD),
+        "ma_fast_closed": sma(closes_closed, MA_FAST_PERIOD),
+        "ma_slow_closed": sma(closes_closed, MA_SLOW_PERIOD),
+        "ma_fast_prev": sma(closes_prev, MA_FAST_PERIOD),
+        "ma_slow_prev": sma(closes_prev, MA_SLOW_PERIOD),
         "midline": midline,
         "volume": ksig[-1]["volume"],
         "volume_sma": sma(volumes, VOL_SMA_PERIOD),
@@ -966,8 +978,8 @@ def reconcile_live_positions(live_trader: LiveTrader, positions: dict,
       不平仓（2026-11-19 教训：可能是用户手动取消），大声记一笔，持仓继续由用户管理。
       孤儿持仓（state 里没有）才按策略重建保护。
     - 交易所里有、state 里没有（孤儿持仓）：绝不能丢。先从挂单里找止损/止盈认领；
-      缺哪条按策略盈亏比（止盈 = 1.5 倍止损距离）从另一条反推重建；两条都没有
-      就立刻市价平仓。认领后该币种随持仓自动停新单（每币种最多 1 单）。
+      缺哪条按策略从另一条反推重建（旧模式止盈 = 1.5 倍止损距离；交叉模式用固定点数）；
+      两条都没有就立刻市价平仓。认领后该币种随持仓自动停新单（每币种最多 1 单）。
     - 交易所和 state 都没有，但有挂单：多余挂单全撤掉，免得以后意外成交。
     对账本身拉不到交易所状态：该币种加进 blocked，暂停新开单，同时记进 retryable，
     主循环定期重试，成功自动解除。市价平仓也失败（交易所仍有持仓）才需人工处理，
@@ -1102,8 +1114,12 @@ def reconcile_live_positions(live_trader: LiveTrader, positions: dict,
         need_close = False
         if sl_order is None and tp_order is not None:
             if saved is None:
-                tp_dist = abs(position["take_profit"] - entry)
-                sl = entry - tp_dist / 1.5 if side == "LONG" else entry + tp_dist / 1.5
+                if CROSS_MODE_ENABLED:
+                    sl_dist = CROSS_SL_POINTS.get(symbol, 1000.0)
+                    sl = entry - sl_dist if side == "LONG" else entry + sl_dist
+                else:
+                    tp_dist = abs(position["take_profit"] - entry)
+                    sl = entry - tp_dist / 1.5 if side == "LONG" else entry + tp_dist / 1.5
                 try:
                     position["sl_order_id"] = live_trader.place_stop(symbol, side, sl)
                     position["stop_loss"] = sl
@@ -1117,8 +1133,12 @@ def reconcile_live_positions(live_trader: LiveTrader, positions: dict,
                     f"持仓继续由用户管理，不重挂。原止损价 {position['stop_loss']:.1f} 仅作显示。")
         if tp_order is None and sl_order is not None and not need_close:
             if saved is None:
-                sl_dist = abs(position["stop_loss"] - entry)
-                tp = entry + sl_dist * 1.5 if side == "LONG" else entry - sl_dist * 1.5
+                if CROSS_MODE_ENABLED:
+                    tp_dist = CROSS_TP_POINTS.get(symbol, 200.0)
+                    tp = entry + tp_dist if side == "LONG" else entry - tp_dist
+                else:
+                    sl_dist = abs(position["stop_loss"] - entry)
+                    tp = entry + sl_dist * 1.5 if side == "LONG" else entry - sl_dist * 1.5
                 try:
                     position["tp_order_id"] = live_trader.place_take_profit(symbol, side, qty, tp)
                     position["take_profit"] = tp
@@ -1181,13 +1201,13 @@ def main() -> None:
     log("=" * 60)
     log("BTC+ETH 合约短线机器人启动（10 倍快进快出方案，2026-11-10 用户确认；2026-11-11 加 ETH）")
     log(f"标的: {', '.join(SYMBOLS)} | Dry-Run: {DRY_RUN} | 实盘开关: {LIVE_TRADING_ENABLED} | 实盘已开: {live_trading_active()}")
-    log("策略: 趋势模式已停（2026-11-20 用户决定：只做震荡）——1h ADX>=25 或拿不到时空仓等，不开单；"
-        "<25 震荡用 range 反转策略：2/3 票 + 只在 6 小时区间下 1/4 做多、上 1/4 做空，止损沿外 1.5 倍 ATR，"
-        "止盈到对面沿；range 有过度延伸过滤：离 6 小时极端点超 3 倍 ATR 不追）+ 量能过滤；"
-        "震荡止损沿外 1.5 倍 ATR，止盈到对面沿；赚 1 倍风险保本；"
-        "进场限价单，止损市价单；冷却 15 分钟（止损后 30 分钟，3/3 强信号可跳过）；"
+    log("策略: 均线交叉模式（2026-11-20 用户决定：趋势/震荡全部停用）——5 分钟收盘 K 线 MA5 上穿 MA20 做多、"
+        "下穿做空，只在交叉那根收盘开单；固定点数止盈止损：BTC 止盈 200 点、止损 1000 点，"
+        "ETH 止盈 6 点、止损 28 点（按比价折算）；反向交叉不强制平仓，等止盈/止损；"
+        "保本实际失效（1 倍风险 = 1000 点，止盈 200 点先到）；"
+        "进场限价单，止损市价单；冷却 15 分钟（止损后 30 分钟）；"
         "每个币种一天最多 10 单、同时最多 1 单（全账户同时最多 2 单）")
-    log("风控: 10 倍 / 每单固定 200U 保证金（名义 2000U）/ 单笔亏损硬上限 40U / "
+    log("风控: 10 倍 / 每单固定 300U 保证金（名义 3000U）/ 单笔亏损硬上限 60U / "
         f"日亏熔断 {MAX_DAILY_LOSS_USDT:.0f}U / 连亏 3 单休息 1 小时 / 大消息前后 30 分钟不交易")
     # 启动就记出口 IP（模拟盘和实盘都记）：币安白名单必须包含它；
     # 实盘下单器建失败会直接退出，放在这里才能保证 IP 一定被记下来。
@@ -1401,15 +1421,22 @@ def main() -> None:
 
             # 入场按判断时的实时价，不用滞后的 5 分钟 K 线收盘价（2026-11-10 的教训：
             # 收盘价 72964.9 开单时实时价已到约 73290，差了 325 点）
+            # 均线交叉模式用收盘均线判断交叉（未收盘那根不算，避免交叉反复横跳），
+            # 但入场价仍用实时价。
+            cross_mode = indicators["mode"] == "cross"
             signal = evaluate(price=price, atr=indicators["atr"],
                               adx15=indicators["adx15"],
-                              ma_fast=indicators["ma_fast"], ma_slow=indicators["ma_slow"],
+                              ma_fast=indicators["ma_fast_closed"] if cross_mode else indicators["ma_fast"],
+                              ma_slow=indicators["ma_slow_closed"] if cross_mode else indicators["ma_slow"],
                               midline=indicators["midline"],
                               volume=indicators["volume"], volume_sma=indicators["volume_sma"],
                               range_high=indicators["range_high"],
                               range_low=indicators["range_low"],
                               mode=indicators["mode"],
                               ema_trend=indicators["ema_trend"],
+                              symbol=symbol,
+                              ma_fast_prev=indicators["ma_fast_prev"],
+                              ma_slow_prev=indicators["ma_slow_prev"],
                               log=log if is_new_candle else None)
             if signal is None:
                 if is_new_candle:
@@ -1438,7 +1465,7 @@ def main() -> None:
                 entry=signal["entry"], stop_loss=signal["stop_loss"]
             )
             if qty <= 0:
-                log(f"风控拦截：按止损距离算，亏损会超 40 U 上限（算出 {max_loss:.2f} U），放弃这单。")
+                log(f"风控拦截：按止损距离算，亏损会超 60 U 上限（算出 {max_loss:.2f} U），放弃这单。")
                 continue
             signal["max_loss_usdt"] = max_loss
 

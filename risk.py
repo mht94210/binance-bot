@@ -170,10 +170,11 @@ class RiskManager:
     # ---------- 仓位计算 ----------
     def size_position(self, entry: float, stop_loss: float) -> tuple[float, float, float]:
         """
-        固定保证金仓位（2026-11-17 用户决定：每单固定 200U 保证金，跟日本剥头皮一样）：
-        名义仓位 = 200 x 10 = 2000 U，数量 = 2000 / 入场价。止损多远就亏多少，
+        固定保证金仓位（2026-11-17 用户决定：每单固定 200U 保证金，跟日本剥头皮一样；
+        2026-11-20 用户决定：提到 300U）：
+        名义仓位 = 300 x 10 = 3000 U，数量 = 3000 / 入场价。止损多远就亏多少，
         不再按固定 10U 风险倒推仓位。返回 (数量, 保证金 USDT, 预期最大亏损 USDT)。
-        预期最大亏损按 Taker 手续费保守估算；超 40 U 硬上限返回数量 0，放弃这单。
+        预期最大亏损按 Taker 手续费保守估算；超 60 U 硬上限返回数量 0，放弃这单。
         """
         stop_distance = abs(entry - stop_loss)
         if stop_distance <= 0 or entry <= 0:
@@ -198,4 +199,4 @@ class RiskManager:
         if signal["side"] not in ("LONG", "SHORT"):
             raise ValueError("拒绝下单：方向不是 LONG/SHORT。")
         if signal.get("max_loss_usdt", 9999) > MAX_LOSS_PER_TRADE_USDT:
-            raise ValueError("拒绝下单：单笔亏损超 40 U 上限。")
+            raise ValueError("拒绝下单：单笔亏损超 60 U 上限。")
