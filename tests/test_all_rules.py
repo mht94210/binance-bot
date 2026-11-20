@@ -12,6 +12,8 @@ A) 少而精：3/3 全票、保证金 400U、5m 信号/ATR；2026-11-16 去掉 E
    2026-11-19 用户决定（2 小时窗口跟着价格滑、震荡开不出单）：区间窗口 2 小时 -> 6 小时，区间回看 72 根
    2026-11-20 用户决定（5 单趋势单全亏，3 个空离 EMA50 4.4-5.2 倍 ATR）：趋势进场加 EMA50 距离门
    （现价离 EMA50 不超过 1 倍 ATR 才进，太远等回踩；回测挡住 3 个空，2 个多不受影响）
+   2026-11-20 用户决定（趋势新版 0 胜 6 负 -79.53U，距离门拦不住）：趋势模式先停，只做震荡
+   （TREND_MODE_ENABLED=False：1h ADX>=25 或拿不到都返回 paused，不开单；只有 <25 才走 range）
 B) 放宽止损：趋势/动量止损 2 倍 ATR、止盈 3 倍 ATR、盈亏比 1:1.5
 C) 冷却跳过：3/3 强信号跳过冷却；连亏暂停/消息禁入/每日熔断是硬刹车
 D) 熔断：日熔断 100U；state.json 丢失时收紧到 50U；UTC 午夜恢复 100U
@@ -40,6 +42,7 @@ from config import (
 )
 import main
 from risk import RiskManager
+import strategy
 from strategy import evaluate, select_mode
 
 FAILURES = []
@@ -106,13 +109,34 @@ def test_overextension_filter():
 
 
 def test_select_mode():
-    # 2026-11-17 用户决定：震荡上限从 15 提到 25，<25 全走震荡，>=25 走趋势；动量只剩 1h ADX 拿不到时的默认兜底。
-    check(select_mode(30.0) == "trend", "模式 1h ADX 30 -> trend")
-    check(select_mode(25.0) == "trend", "模式 1h ADX 25（边界）-> trend")
-    check(select_mode(20.0) == "range", "模式 1h ADX 20 -> range（震荡上限提到 25）")
+    # 2026-11-20 用户决定：趋势模式先停，只做震荡（TREND_MODE_ENABLED=False 默认）——
+    # 1h ADX>=25 或拿不到都返回 paused，不开单；只有 <25 才走 range。
+    check(select_mode(30.0) == "paused", "模式 1h ADX 30 -> paused（趋势已停）")
+    check(select_mode(25.0) == "paused", "模式 1h ADX 25（边界）-> paused（趋势已停）")
+    check(select_mode(20.0) == "range", "模式 1h ADX 20 -> range")
     check(select_mode(15.0) == "range", "模式 1h ADX 15 -> range")
     check(select_mode(10.0) == "range", "模式 1h ADX 10 -> range")
-    check(select_mode(None) == "momentum", "模式 1h ADX 拿不到 -> 默认 momentum")
+    check(select_mode(None) == "paused", "模式 1h ADX 拿不到 -> paused（只做震荡，不走动量兜底）")
+    # 开关拨回 True 就恢复旧行为（可逆，改一行配置的事）
+    old = strategy.TREND_MODE_ENABLED
+    try:
+        strategy.TREND_MODE_ENABLED = True
+        check(select_mode(30.0) == "trend", "开关 True 时 1h ADX 30 -> trend（可恢复）")
+        check(select_mode(25.0) == "trend", "开关 True 时 1h ADX 25（边界）-> trend（可恢复）")
+        check(select_mode(None) == "momentum", "开关 True 时 1h ADX 拿不到 -> momentum（可恢复）")
+    finally:
+        strategy.TREND_MODE_ENABLED = old
+
+
+def test_paused_mode():
+    # 2026-11-20 用户决定：趋势模式先停——paused 模式下任何信号都不开，包括 3/3 全票。
+    check(evaluate(**base_kwargs(mode="paused")) is None,
+          "paused 模式：做空 3/3 票也不开")
+    long_kw = dict(price=2070.0, ma_fast=2065.0, ma_slow=2060.0, midline=2060.0)
+    check(evaluate(**base_kwargs(**long_kw, mode="paused")) is None,
+          "paused 模式：做多 3/3 票也不开")
+    check(evaluate(**base_kwargs(mode="paused", range_high=2070.0, range_low=2030.0)) is None,
+          "paused 模式：带区间数据也不开")
 
 
 def test_trend_mode():
@@ -408,6 +432,7 @@ if __name__ == "__main__":
     test_no_adx_gate()
     test_overextension_filter()
     test_select_mode()
+    test_paused_mode()
     test_trend_mode()
     test_trend_ema_distance()
     test_range_mode()

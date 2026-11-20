@@ -43,6 +43,7 @@ from config import (
     TP_ATR_MULT,
     TREND_ADX_MIN,
     TREND_EMA_MAX_DIST_ATR,
+    TREND_MODE_ENABLED,
 )
 
 
@@ -53,11 +54,14 @@ def select_mode(adx1h: float | None) -> str:
     1 小时 ADX 是大趋势强度：>=25 强趋势 -> trend（原 6 胜策略思路，前两天大跌时能用上），
     <25 震荡 -> range（反转策略）。动量模式只剩 1 小时 ADX 拿不到时的默认兜底。
     1 小时 ADX 拿不到时默认 momentum（当前策略，最稳妥的中间态）。
+    2026-11-20 用户决定：趋势模式先停，只做震荡（TREND_MODE_ENABLED=False 时，
+    1h ADX>=25 或拿不到 1h ADX 都返回 "paused"，evaluate 直接挡掉、不开单；
+    只有 1h ADX<25 才走 range）。
     """
     if adx1h is None:
-        return "momentum"
+        return "paused" if not TREND_MODE_ENABLED else "momentum"
     if adx1h >= REGIME_ADX_TREND:
-        return "trend"
+        return "paused" if not TREND_MODE_ENABLED else "trend"
     if adx1h < REGIME_ADX_RANGE:
         return "range"
     return "momentum"
@@ -102,7 +106,8 @@ def evaluate(price: float, atr: float | None,
     按含当前未收盘 K 线的 5 分钟 K 线算（2026-11-16 用户决定，解决进场晚）。
     range_high / range_low 是过去 6 小时区间的最高最低价（不传则不过度延伸过滤，
     range 模式也做不了位置确认）。
-    mode 是策略模式（select_mode 按 1 小时 ADX 选出）：trend / momentum / range。
+    mode 是策略模式（select_mode 按 1 小时 ADX 选出）：trend / momentum / range /
+    paused（趋势已停时，evaluate 直接挡掉不开单）。
     ema_trend 是 5 分钟 EMA50（只 trend 模式用）。
     指标缺失（预热期）时直接返回 None，不过滤也不开单。
     返回信号 dict，或 None（无信号）。信号一定带 stop_loss 和 take_profit。
@@ -120,12 +125,18 @@ def evaluate(price: float, atr: float | None,
       2026-11-17 起只剩 1h ADX 拿不到时的默认兜底。
     - range（反转策略）：2/3 票 + 位置确认——只在 6 小时区间下 1/4 做多、上 1/4
       做空；再加过度延伸过滤。止损 = 区间沿外 1.5 倍 ATR，止盈 = 对面沿。
+    - paused（2026-11-20 用户决定：趋势模式先停）：不开单，等 1h ADX 回落到 25 以下再做震荡。
     共通：手续费地板（止盈目标 < 0.30% 不做，按实际止盈距离算）；冷却与额度由风控器管，不在这里判断。
     """
     def _blocked(reason: str):
         if log is not None:
             log(f"信号被挡：{reason}")
         return None
+
+    # 趋势模式已停（2026-11-20 用户决定：只做震荡）：paused 下任何信号都不开，
+    # 放在预热检查前面——停用期连指标都不用等，直接写明原因。
+    if mode == "paused":
+        return _blocked("趋势模式已停（2026-11-20 用户决定：只做震荡），1h ADX 在 25 以上或拿不到，空仓等回落到 25 以下再做震荡。")
 
     if atr is None or atr <= 0:
         return _blocked("ATR 还没算出来（5 分钟 K 线不够 15 根），等预热。")
