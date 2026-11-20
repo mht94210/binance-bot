@@ -10,6 +10,8 @@ A) 少而精：3/3 全票、保证金 400U、5m 信号/ATR；2026-11-16 去掉 E
    2026-11-18 用户决定（15 分钟信号反弹抓不住）：信号周期改成 5 分钟；1h ADX 定模式、2 小时区间、
    止损止盈倍数、固定 200U、冷却/熔断都不变；区间回看 24 根 5 分钟 K 线，分界线回看 12 根
    2026-11-19 用户决定（2 小时窗口跟着价格滑、震荡开不出单）：区间窗口 2 小时 -> 6 小时，区间回看 72 根
+   2026-11-20 用户决定（5 单趋势单全亏，3 个空离 EMA50 4.4-5.2 倍 ATR）：趋势进场加 EMA50 距离门
+   （现价离 EMA50 不超过 1 倍 ATR 才进，太远等回踩；回测挡住 3 个空，2 个多不受影响）
 B) 放宽止损：趋势/动量止损 2 倍 ATR、止盈 3 倍 ATR、盈亏比 1:1.5
 C) 冷却跳过：3/3 强信号跳过冷却；连亏暂停/消息禁入/每日熔断是硬刹车
 D) 熔断：日熔断 100U；state.json 丢失时收紧到 50U；UTC 午夜恢复 100U
@@ -34,6 +36,7 @@ from config import (
     SIGNAL_INTERVAL_MINUTES,
     SL_ATR_MULT,
     TP_ATR_MULT,
+    TREND_EMA_MAX_DIST_ATR,
 )
 import main
 from risk import RiskManager
@@ -115,22 +118,58 @@ def test_select_mode():
 def test_trend_mode():
     # 2026-11-16 用户决定：trend 模式 = 原 6 胜策略思路（EMA50 方向过滤 + 5m ADX>25 + 3/3 票）。
     # 过度延伸过滤不适用（大趋势就是要追）。
-    check(evaluate(**base_kwargs(mode="trend", ema_trend=2050.0, range_high=2070.0)) is not None,
+    # 2026-11-20 加 EMA50 距离门：现价离 EMA50 不超过 1 倍 ATR（atr=7.5，门 = 7.5 点），
+    # 所以下面通过的用例 EMA50 离现价只放 5 点（0.67 倍），距离门本身的用例见 test_trend_ema_distance。
+    check(evaluate(**base_kwargs(mode="trend", ema_trend=2045.0, range_high=2070.0)) is not None,
           "趋势 做空 3/3 + 现价在 EMA50 下方 + ADX 35>25 触发（跌 30 点也不被过度延伸挡）")
-    sig = evaluate(**base_kwargs(mode="trend", ema_trend=2050.0))
+    sig = evaluate(**base_kwargs(mode="trend", ema_trend=2045.0))
     check(sig is not None and sig["side"] == "SHORT" and sig["mode"] == "trend",
           "趋势 做空信号 mode 字段是 trend")
     check(evaluate(**base_kwargs(mode="trend", ema_trend=2030.0)) is None,
           "趋势 做空 3/3 但现价在 EMA50 上方（逆势）挡住")
-    check(evaluate(**base_kwargs(mode="trend", ema_trend=2050.0, adx15=20.0)) is None,
+    check(evaluate(**base_kwargs(mode="trend", ema_trend=2045.0, adx15=20.0)) is None,
           "趋势 5m ADX 20 不到 25 挡住")
     check(evaluate(**base_kwargs(mode="trend", ema_trend=None)) is None,
           "趋势 EMA50 没算出来挡住")
     long_kw = dict(price=2070.0, ma_fast=2065.0, ma_slow=2060.0, midline=2060.0)
-    check(evaluate(**base_kwargs(**long_kw, mode="trend", ema_trend=2060.0)) is not None,
+    check(evaluate(**base_kwargs(**long_kw, mode="trend", ema_trend=2065.0)) is not None,
           "趋势 做多 3/3 + 现价在 EMA50 上方 + ADX 35>25 触发")
     check(evaluate(**base_kwargs(**long_kw, mode="trend", ema_trend=2080.0)) is None,
           "趋势 做多 3/3 但现价在 EMA50 下方（逆势）挡住")
+
+
+def test_trend_ema_distance():
+    # 2026-11-20 用户决定：趋势进场加 EMA50 距离门——现价离 EMA50 不超过 1 倍 ATR 才进。
+    # 依据：UTC 11-19 新应用 5 单趋势单全亏，3 个空离 EMA50 4.4-5.2 倍 ATR（回测：5 分钟线，
+    # 收盘价算 EMA50/ATR）；2 个多离 EMA50 只有 0.35/0.55 倍，门挡不住它们（另案处理）。
+    check(TREND_EMA_MAX_DIST_ATR == 1.0, "趋势 EMA50 距离门 = 1 倍 ATR")
+    # 做空离 EMA50 10 点 = 1.33 倍 ATR，挡住
+    check(evaluate(**base_kwargs(mode="trend", ema_trend=2050.0)) is None,
+          "趋势 做空离 EMA50 10 点（1.33 倍 ATR）挡住，等回踩")
+    # 做空离 EMA50 5 点 = 0.67 倍 ATR，放行
+    check(evaluate(**base_kwargs(mode="trend", ema_trend=2045.0)) is not None,
+          "趋势 做空离 EMA50 5 点（0.67 倍 ATR）放行")
+    # 正好 1 倍 ATR（7.5 点）不挡，只挡超过的
+    check(evaluate(**base_kwargs(mode="trend", ema_trend=2047.5)) is not None,
+          "趋势 做空离 EMA50 正好 1 倍 ATR（7.5 点）不挡")
+    # 做多离 EMA50 10 点 = 1.33 倍 ATR，挡住
+    long_kw = dict(price=2070.0, ma_fast=2065.0, ma_slow=2060.0, midline=2060.0)
+    check(evaluate(**base_kwargs(**long_kw, mode="trend", ema_trend=2060.0)) is None,
+          "趋势 做多离 EMA50 10 点（1.33 倍 ATR）挡住，等回踩")
+    check(evaluate(**base_kwargs(**long_kw, mode="trend", ema_trend=2065.0)) is not None,
+          "趋势 做多离 EMA50 5 点（0.67 倍 ATR）放行")
+    # 真实回测回归：#1 BTC SHORT @61794.8，信号时 EMA50 62771.9、ATR 187.3，离 5.22 倍 ATR——挡住
+    check(evaluate(price=61794.8, atr=187.3, adx15=27.0, ma_fast=61700.0, ma_slow=61800.0,
+                   midline=61850.0, volume=100.0, volume_sma=80.0,
+                   mode="trend", ema_trend=62771.9) is None,
+          "趋势 #1 真实空单离 EMA50 5.22 倍 ATR，挡住")
+    # #4 BTC LONG 信号价 62221.5，EMA50 62191.1、ATR 178.7，离 0.17 倍 ATR——门挡不住（诚实记录：
+    # 这单是 5 分钟反弹撞上更大的下跌，距离门不是它的解法）
+    sig4 = evaluate(price=62221.5, atr=178.7, adx15=27.0, ma_fast=62250.0, ma_slow=62150.0,
+                    midline=62100.0, volume=100.0, volume_sma=80.0,
+                    mode="trend", ema_trend=62191.1)
+    check(sig4 is not None and sig4["side"] == "LONG",
+          "趋势 #4 真实多单离 EMA50 0.17 倍 ATR，门不挡（这单的问题不在距离）")
 
 
 def test_range_mode():
@@ -370,6 +409,7 @@ if __name__ == "__main__":
     test_overextension_filter()
     test_select_mode()
     test_trend_mode()
+    test_trend_ema_distance()
     test_range_mode()
     test_direction_from_5m()
     test_fixed_margin_200()

@@ -113,6 +113,7 @@ REGIME_ADX_RANGE = 25.0   # 1h ADX < 25：震荡 -> range 模式（2026-11-17 �
                           # 横盘让震荡接管；动量模式只剩 1h ADX 拿不到时的默认兜底）
 EMA_TREND_PERIOD = 50     # trend 模式的方向过滤均线（5 分钟 EMA50；用户 2026-11-15 嫌 EMA200 太慢改成 50）
 TREND_ADX_MIN = 25.0      # trend 模式的 ADX 门槛（5 分钟 ADX > 25 才做；用户 2026-11-16 从 30 降到 25）
+TREND_EMA_MAX_DIST_ATR = 1.0  # trend 模式进场门：现价离 EMA50 不超过 1 倍 ATR（2026-11-20 用户决定：5 单趋势单全亏，3 个空离 EMA50 4.4-5.2 倍 ATR，都是等确认后追在极端点；离线太远不追，等回踩 EMA50 再进）
 RANGE_EDGE_FRACTION = 0.25  # range 模式：只在 6 小时区间的下 1/4 做多、上 1/4 做空
 RANGE_SL_ATR_MULT = 1.5   # range 模式止损 = 区间沿外 1.5 倍 ATR（2026-11-17 用户决定：0.5 倍太紧，
                           # 一根 15 分钟 K 线就能打到；2026-11-18 信号改 5 分钟后 ATR 更小，距离随之变窄）
