@@ -71,6 +71,9 @@ from config import (
     MAX_DAILY_LOSS_USDT,
     MAX_OPEN_POSITIONS,
     MIDLINE_LOOKBACK_CANDLES,
+    MOMENTUM_REGIME_ENABLED,
+    MOMENTUM_REGIME_LOOKBACK,
+    MOMENTUM_REGIME_PCT,
     RANGE_LOOKBACK_CANDLES,
     RECONCILE_RETRY_SECONDS,
     RECV_WINDOW_MS,
@@ -178,7 +181,7 @@ def compute_indicators(symbol: str) -> dict | None:
     2026-11-16 用户决定去掉 EMA50 方向过滤和 ADX 门槛，短线看 5 分钟波动选方向，
     多空来回做。
     """
-    ksig = get_klines(symbol, SIGNAL_INTERVAL, 80)
+    ksig = get_klines(symbol, SIGNAL_INTERVAL, MOMENTUM_REGIME_LOOKBACK + 32)
     if len(ksig) < ATR_PERIOD + 2 or len(ksig) < ADX_PERIOD * 2 + 1:
         log(f"{symbol} K 线不够，指标算不出来，等下一根 5 分钟 K 线。")
         return None
@@ -196,6 +199,13 @@ def compute_indicators(symbol: str) -> dict | None:
     # 上一根收盘的均线也要，用来判断最新收盘有没有发生交叉。
     closes_closed = closes[:-1]
     closes_prev = closes[:-2]
+    # 动量区制（2026-11-21 用户决定）：最新收盘价相对 24 小时前（288 根前）收盘价的涨跌幅；
+    # 与回测口径一致：信号那根收盘价 / 288 根前收盘价 - 1。K 线不够 289 根已收盘时为 None（不拦单）。
+    chg_24h = None
+    if len(closes_closed) > MOMENTUM_REGIME_LOOKBACK:
+        ref_24h = closes_closed[-1 - MOMENTUM_REGIME_LOOKBACK]
+        if ref_24h:
+            chg_24h = closes_closed[-1] / ref_24h - 1
     # trend 模式的方向过滤均线（5 分钟 EMA50）
     ema_trend_value = ema(closes, EMA_TREND_PERIOD)
     # 滚动分界线：最近 12 根 5 分钟 K 线（60 分钟）最高最低价的中点，跟着市场走
@@ -224,6 +234,7 @@ def compute_indicators(symbol: str) -> dict | None:
         "adx1h": adx1h_value,
         "mode": mode,
         "ema_trend": ema_trend_value,
+        "chg_24h": chg_24h,
     }
 
 
@@ -1155,6 +1166,7 @@ def main() -> None:
         "下穿做空，只在交叉那根收盘开单；固定点数止盈止损：BTC 止盈 200 点、止损 1000 点，"
         "ETH 止盈 6 点、止损 28 点（按比价折算）；反向交叉不强制平仓，等止盈/止损；"
         "保本实际失效（1 倍风险 = 1000 点，止盈 200 点先到）；"
+        "动量区制（2026-11-21 用户决定）：24h 涨跌超 ±5% 只做顺动量方向（跌超 5% 只做空、涨超 5% 只做多），平时双向；"
         "进场限价单，止损市价单；冷却 15 分钟（止损后 30 分钟）；"
         "每个币种一天最多 10 单、同时最多 1 单（全账户同时最多 2 单）")
     log("风控: 10 倍 / 每单固定 300U 保证金（名义 3000U）/ 单笔亏损硬上限 60U / "
@@ -1390,11 +1402,26 @@ def main() -> None:
                               log=log if is_new_candle else None)
             if signal is None:
                 if is_new_candle:
-                    log(f"无信号，{symbol} 现价 {price:.1f}（5m 收 {indicators['price']:.1f}），继续等。")
+                    chg_txt = ""
+                    chg_24h = indicators.get("chg_24h")
+                    if chg_24h is not None:
+                        chg_txt = f"，24h {chg_24h * 100:+.1f}%"
+                    log(f"无信号，{symbol} 现价 {price:.1f}（5m 收 {indicators['price']:.1f}{chg_txt}），继续等。")
                 continue
 
             signal["symbol"] = symbol
             log(f"信号触发: {symbol} {signal['side']} @ {signal['entry']:.1f} 原因: {signal['reason']}")
+
+            # 动量区制（2026-11-21 用户决定）：24h 跌超 5% 只做空、涨超 5% 只做多，平时双向。
+            # 拿不到 24h 涨跌幅时不拦（fail open）。拦单只记日志，不报开单。
+            chg_24h = indicators.get("chg_24h")
+            if MOMENTUM_REGIME_ENABLED and chg_24h is not None:
+                if chg_24h < -MOMENTUM_REGIME_PCT and signal["side"] == "LONG":
+                    log(f"风控拦截：动量区制：{symbol} 24h 涨跌 {chg_24h * 100:.1f}%（跌超 5%），只做空，不做多。")
+                    continue
+                if chg_24h > MOMENTUM_REGIME_PCT and signal["side"] == "SHORT":
+                    log(f"风控拦截：动量区制：{symbol} 24h 涨跌 {chg_24h * 100:.1f}%（涨超 5%），只做多，不做空。")
+                    continue
 
             # 全账户同时持仓上限（每个币种最多 1 单）
             open_count = sum(1 for p in positions.values() if p is not None)

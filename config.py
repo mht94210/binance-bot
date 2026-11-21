@@ -131,6 +131,14 @@ CROSS_MODE_ENABLED = True  # 交叉模式总开关：True 时 select_mode 不再
                            # 改回 False 即恢复趋势暂停/震荡模式（TREND_MODE_ENABLED=False 时 paused + range）
 CROSS_TP_POINTS = {"BTCUSDT": 200.0, "ETHUSDT": 6.0}     # 交叉模式止盈点数（BTC 200 点；ETH 按比价折算约 5.7 点取整 6 点）
 CROSS_SL_POINTS = {"BTCUSDT": 1000.0, "ETHUSDT": 28.0}   # 交叉模式止损点数（BTC 1000 点；ETH 按比价折算约 28 点）
+# ---------- 动量区制（2026-11-21 用户决定：瀑布里做多一直跌，5 分钟金叉买在反弹高点）----------
+MOMENTUM_REGIME_ENABLED = True  # 动量区制总开关：24h 涨跌超阈值只做顺动量方向，平时双向。
+                                # 回测 11-13~11-21（300U/单，含手续费）：+227.68U，震荡期 +211.76U /
+                                # 趋势期 +15.92U；现行 A 为 +326.26U，区制少赚约 100U，但瀑布里不再做多。
+                                # 1h/4h 趋势过滤回测 -181U/-162U，等一根确认入场 -217U，1:1 盈亏比 +45U/-65U，
+                                # 只做空 +100U，都更差。瀑布里多单 -50.51U、空单 +75.87U，是改的直接原因。
+MOMENTUM_REGIME_PCT = 0.05      # 24 小时涨跌幅阈值 ±5%（相对 288 根 5 分钟 K 线前的收盘价）
+MOMENTUM_REGIME_LOOKBACK = 288  # 24 小时 = 288 根 5 分钟 K 线
 RANGE_EDGE_FRACTION = 0.25  # range 模式：只在 6 小时区间的下 1/4 做多、上 1/4 做空
 RANGE_SL_ATR_MULT = 1.5   # range 模式止损 = 区间沿外 1.5 倍 ATR（2026-11-17 用户决定：0.5 倍太紧，
                           # 一根 15 分钟 K 线就能打到；2026-11-18 信号改 5 分钟后 ATR 更小，距离随之变窄）
