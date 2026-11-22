@@ -35,6 +35,7 @@ from config import (
     MAX_DAILY_LOSS_USDT,
     MAX_MARGIN_PER_TRADE_USDT,
     MIDLINE_LOOKBACK_CANDLES,
+    MOMENTUM_REGIME_LOOKBACK,
     RANGE_LOOKBACK_CANDLES,
     SIGNAL_INTERVAL,
     SIGNAL_INTERVAL_MINUTES,
@@ -298,7 +299,9 @@ def test_signal_timeframe_5m():
     check(SIGNAL_INTERVAL_MINUTES == 5, f"A 信号周期 5 分钟（实得 {SIGNAL_INTERVAL_MINUTES}）")
     check(RANGE_LOOKBACK_CANDLES == 72, f"A 6 小时区间回看 72 根 5m K 线（实得 {RANGE_LOOKBACK_CANDLES}）")
     check(MIDLINE_LOOKBACK_CANDLES == 12, f"A 分界线回看 12 根 5m K 线（实得 {MIDLINE_LOOKBACK_CANDLES}）")
-    # compute_indicators 必须拉 5m K 线（80 根，够 72 根区间回看 + EMA50），
+    # compute_indicators 必须拉 5m K 线（动量区制 288 根回看 + 32 根缓冲 = 320 根，
+    # 2026-11-21 动量区制版改动：原来 80 根只够 72 根区间回看 + EMA50；
+    # K 线不够 289 根已收盘时 24h 涨跌幅算不出来、区制不拦单），
     # 区间高低取最后 72 根，分界线取最后 12 根，1h ADX 仍拉 1h K 线定模式。
     from unittest.mock import patch
 
@@ -307,7 +310,7 @@ def test_signal_timeframe_5m():
         return {"open_time": i * 300000, "open": c, "high": c + 5.0,
                 "low": c - 5.0, "close": c, "volume": 100.0}
 
-    k5m = [_candle(i, 63000.0) for i in range(80)]
+    k5m = [_candle(i, 63000.0) for i in range(MOMENTUM_REGIME_LOOKBACK + 32)]
     k1h = [{"open_time": i * 3600000, "open": 64000.0, "high": 64010.0,
             "low": 63990.0, "close": 64000.0, "volume": 50.0} for i in range(40)]
     calls = []
@@ -318,7 +321,8 @@ def test_signal_timeframe_5m():
 
     with patch.object(main, "get_klines", side_effect=_fake_klines):
         ind = main.compute_indicators("BTCUSDT")
-    check(calls[0] == ("BTCUSDT", "5m", 80), f"A 信号 K 线拉 5m 80 根（实得 {calls[0]}）")
+    check(calls[0] == ("BTCUSDT", "5m", MOMENTUM_REGIME_LOOKBACK + 32),
+          f"A 信号 K 线拉 5m {MOMENTUM_REGIME_LOOKBACK + 32} 根（实得 {calls[0]}）")
     check(calls[1] == ("BTCUSDT", "1h", 40), f"A 1h ADX 仍拉 1h K 线（实得 {calls[1]}）")
     check(ind is not None, "A 5m K 线够用，指标算得出来")
     if ind is not None:
@@ -337,6 +341,11 @@ def test_signal_timeframe_5m():
         check(ind["mode"] == "cross", f"A 交叉模式：1h ADX 再小也是 cross（实得 {ind['mode']}）")
         check(ind["ma_fast_closed"] is not None and ind["ma_fast_prev"] is not None,
               "A 交叉模式：收盘均线（最新/上一根）都算得出来")
+        # 2026-11-21 动量区制：320 根 K 线里已收盘 319 根，24h 涨跌 = 最新收盘 /
+        # 288 根前收盘 - 1（第 319 根 66180 / 第 31 根 63300 - 1 ≈ +4.55%，未超 ±5%）。
+        exp_chg = 66180.0 / 63300.0 - 1
+        check(ind["chg_24h"] is not None and abs(ind["chg_24h"] - exp_chg) < 1e-9,
+              f"A 动量区制 24h 涨跌算得出来（实得 {ind['chg_24h']}, 预期 {exp_chg:.6f}）")
 
 
 # ---------- B) 放宽止损 ----------
