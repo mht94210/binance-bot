@@ -32,10 +32,8 @@
 入场按 Post Only 限价单（maker 手续费），止损按市价单；Dry-Run 下按信号价成交。
 """
 from config import (
-    CROSS_MODE_ENABLED,
     CROSS_SL_POINTS,
     CROSS_TP_POINTS,
-    EMA_TREND_PERIOD,
     FEE_FLOOR_PCT,
     OVEREXTENSION_ATR_MULT,
     RANGE_EDGE_FRACTION,
