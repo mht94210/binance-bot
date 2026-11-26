@@ -64,6 +64,7 @@ from config import (
     HOLDING_POLL_SECONDS,
     LEVERAGE,
     LIVE_TRADING_ENABLED,
+    LIVE_TRADER_RETRY_SECONDS,
     MA_FAST_PERIOD,
     MA_SLOW_PERIOD,
     MAKER_FEE_PCT,
@@ -810,6 +811,32 @@ def create_live_trader(api_key: str, api_secret: str) -> LiveTrader:
     return trader
 
 
+def wait_for_live_trader(api_key: str, api_secret: str,
+                         create_fn=None, sleep_fn=None,
+                         retry_seconds: int = LIVE_TRADER_RETRY_SECONDS):
+    """实盘下单器建好才返回：创建失败不再直接退出。
+    最常见是 -2015（出口 IP 未加入币安白名单）：直接退出会让进程反复重启、
+    日志页 503、监控失明，而且加白后还要等下一次重启（2026-11-25 22:04 起
+    断线 10 小时就是这么来的）。改为原地定期重试：日志页（health server
+    是独立线程）一直在线，加白后下个重试周期自动恢复，不用重新部署。
+    等待期间绝不交易（主循环还没进，下单器也没建好）。
+    create_fn / sleep_fn 只为单测注入；默认用 create_live_trader / time.sleep。"""
+    create = create_fn or create_live_trader
+    sleep = sleep_fn or time.sleep
+    while True:
+        try:
+            trader = create(api_key, api_secret)
+            log("实盘下单器已就绪：逐仓 10x，交易所精度已加载。")
+            return trader
+        except Exception as e:  # noqa: BLE001 - 建不起来就等着重试，绝不退出
+            if "-2015" in str(e):
+                log(f"实盘下单器创建失败（-2015：出口 IP 未加入币安白名单）：{e}。"
+                    f"不退出，{retry_seconds // 60} 分钟后重试；加白后自动恢复。")
+            else:
+                log(f"实盘下单器创建失败：{e}。不退出，{retry_seconds // 60} 分钟后重试。")
+            sleep(retry_seconds)
+
+
 def place_order_live(signal: dict, qty: float, margin_usdt: float,
                      live_trader: LiveTrader, blocked: set) -> dict | None:
     """实盘下单入口（2026-11-14 接通：原来是故意留空的桩）。
@@ -1172,7 +1199,7 @@ def main() -> None:
     log("风控: 10 倍 / 每单固定 300U 保证金（名义 3000U）/ 单笔亏损硬上限 60U / "
         f"日亏熔断 {MAX_DAILY_LOSS_USDT:.0f}U / 连亏 3 单休息 1 小时 / 大消息前后 30 分钟不交易")
     # 启动就记出口 IP（模拟盘和实盘都记）：币安白名单必须包含它；
-    # 实盘下单器建失败会直接退出，放在这里才能保证 IP 一定被记下来。
+    # 下单器建失败也不退出（原地重试），但 IP 还是启动时就记，方便查白名单。
     log_egress_ip()
     if not DRY_RUN and not live_trading_active():
         log(f"已拒绝启动：想走实盘但条件不全：{'；'.join(live_trading_missing())}。")
@@ -1248,18 +1275,14 @@ def main() -> None:
     if _warmed:
         log("启动预热：已跳过当前 5 分钟 K 线，等下一根收盘再判断。")
 
-    # 实盘：建下单器 + 启动对账（下单器建不起来就拒绝启动，绝不半实盘跑）
+    # 实盘：建下单器 + 启动对账（下单器建不起来就原地等重试，绝不退出、绝不半实盘跑；
+    # 2026-11-26 自检：以前建失败直接退出，导致 -2015 时进程反复重启、日志页 503）
     live_trader = None
     live_blocked: set = set()
     live_blocked_retryable: set = set()  # 启动对账失败（瞬时拉不到交易所状态）的币种：主循环定期重试
     if live_trading_active():
-        try:
-            api_key, api_secret = load_api_credentials()
-            live_trader = create_live_trader(api_key, api_secret)
-            log("实盘下单器已就绪：逐仓 10x，交易所精度已加载。")
-        except Exception as e:  # noqa: BLE001
-            log(f"已拒绝启动：实盘下单器创建失败：{e}")
-            return
+        api_key, api_secret = load_api_credentials()
+        live_trader = wait_for_live_trader(api_key, api_secret)
         reconcile_live_positions(live_trader, positions, risk, live_blocked,
                                  save_state, retryable=live_blocked_retryable)
 

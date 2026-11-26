@@ -33,6 +33,7 @@ from main import (
     manage_live_position,
     place_order_live,
     reconcile_live_positions,
+    wait_for_live_trader,
 )
 from risk import RiskManager
 
@@ -410,6 +411,49 @@ def test_missing_credentials():
             os.environ["BINANCE_API_KEY"] = saved_env[0]
         if saved_env[1] is not None:
             os.environ["BINANCE_API_SECRET"] = saved_env[1]
+
+
+def test_wait_for_live_trader_retries_on_2015():
+    """-2015（出口 IP 未加白）不退出：重试两次后成功，返回下单器；日志点明白名单。
+    2026-11-26 自检：以前建失败直接退出，导致进程反复重启、日志页 503 断线 10 小时。"""
+    attempts = {"n": 0}
+    sleeps = []
+    sentinel = object()
+
+    def fake_create(key, secret):
+        attempts["n"] += 1
+        if attempts["n"] <= 2:
+            raise RuntimeError("APIError(code=-2015): Invalid API-key, IP, or permissions for action.")
+        return sentinel
+
+    before = len(LOGS)
+    trader = wait_for_live_trader("k", "s", create_fn=fake_create,
+                                  sleep_fn=lambda s: sleeps.append(s),
+                                  retry_seconds=300)
+    new_logs = LOGS[before:]
+    check(trader is sentinel, "-2015 重试两次后成功，返回下单器")
+    check(attempts["n"] == 3, "-2015 共尝试 3 次（2 次失败 + 1 次成功）")
+    check(sleeps == [300, 300], "-2015 每次失败后等 300 秒再重试")
+    check(any("白名单" in m for m in new_logs), "-2015 日志点明是白名单问题")
+    check(any("不退出" in m for m in new_logs), "-2015 日志说明不退出等重试")
+
+
+def test_wait_for_live_trader_retries_on_other_errors():
+    """非 -2015 的创建失败也原地重试（不断线、不退出），成功后返回。"""
+    attempts = {"n": 0}
+    sleeps = []
+
+    def fake_create(key, secret):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("HTTPSConnectionPool: 临时网络错误")
+        return "ok"
+
+    trader = wait_for_live_trader("k", "s", create_fn=fake_create,
+                                  sleep_fn=lambda s: sleeps.append(s),
+                                  retry_seconds=300)
+    check(trader == "ok", "其它创建失败重试一次后成功")
+    check(sleeps == [300], "其它创建失败也等 300 秒再重试")
 
 
 # ---------- 入场 + 保护 ----------
@@ -1320,6 +1364,8 @@ if __name__ == "__main__":
     test_live_switch()
     test_place_order_live_refuses_when_gate_off()
     test_missing_credentials()
+    test_wait_for_live_trader_retries_on_2015()
+    test_wait_for_live_trader_retries_on_other_errors()
     test_entry_fill_places_protection()
     test_entry_timeout_cancels_and_no_position()
     test_entry_rejected_post_only()
